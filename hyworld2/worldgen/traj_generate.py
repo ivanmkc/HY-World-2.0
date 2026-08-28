@@ -41,7 +41,7 @@ from src.navi_utils import (
     select_reconstruct_via_fps,
     filter_and_select_diverse_trajectories,
     compute_trajectory_similarity_matrix,
-    visualize_comparison
+    visualize_comparison,
 )
 from src.panorama_utils import (
     split_panorama_image,
@@ -52,7 +52,7 @@ from src.panorama_utils import (
     convert_rgbd2pcd_panorama,
     convert_rgbd2mesh_panorama,
     smooth_sky_depth_boundary,
-    erp_distance_ray_to_normal
+    erp_distance_ray_to_normal,
 )
 from src.pointcloud import point_rendering
 from src.seg_utils import get_zim_mask, build_gd_model, build_zim_model
@@ -64,7 +64,7 @@ timer = Timer()
 # Runtime environment.
 os.environ["no_proxy"] = "localhost,127.0.0.1,0.0.0.0"
 os.environ["NO_PROXY"] = "localhost,127.0.0.1,0.0.0.0"
-os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 LLM_ADDR = "localhost"
 MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
@@ -92,7 +92,9 @@ def resolve_hf_checkpoint(repo_id, allow_patterns=None, subfolder=None, required
     )
     checkpoint_dir = os.path.join(repo_root, subfolder) if subfolder else repo_root
     required_files = required_files or []
-    missing_files = [filename for filename in required_files if not os.path.exists(os.path.join(checkpoint_dir, filename))]
+    missing_files = [
+        filename for filename in required_files if not os.path.exists(os.path.join(checkpoint_dir, filename))
+    ]
     if missing_files:
         raise FileNotFoundError(f"Checkpoint '{repo_id}' is missing files in {checkpoint_dir}: {missing_files}")
     return checkpoint_dir
@@ -135,8 +137,61 @@ def save_view_initial_data(args_tuple):
     return view_i
 
 
-if __name__ == '__main__':
+class LazyModels:
+    """Builds the optional perception models on first use rather than at startup.
 
+    Every one of these is already guarded at its call site -- ZIM and GroundingDINO by
+    ``scene_type == "outdoor"``, SAM3 by a non-empty object list, and the VLM client by
+    the ``meta_info.json`` and ``objects.json`` caches. Construction was not guarded, so
+    an indoor scene with cached metadata still paid to build all four.
+
+    That is not merely wasteful. ``facebook/sam3`` is a manually gated repository, so
+    without an approved token the unconditional build does not fail, it hangs -- a run
+    was killed after 48 minutes on four A100s having never planned a trajectory, with
+    the last output being GroundingDINO's processor warning.
+
+    Deferring construction changes no behaviour for a scene that does reach these paths:
+    the same models are built with the same arguments, once, on first access.
+    """
+
+    def __init__(self, device):
+        self._device = device
+        self._cache = {}
+
+    def _get(self, name, build):
+        if name not in self._cache:
+            print(f"Models: building {name} on first use...")
+            self._cache[name] = build()
+        return self._cache[name]
+
+    @property
+    def zim(self):
+        return self._get("ZIM", lambda: build_zim_model("vit_l", resolve_zim_checkpoint(), device=self._device))
+
+    @property
+    def grounding_dino(self):
+        """Returns the ``(processor, model)`` pair upstream unpacks."""
+        return self._get("GroundingDINO", lambda: build_gd_model(resolve_gd_checkpoint(), device=self._device))
+
+    @property
+    def vlm(self):
+        return self._get(
+            "Qwen3-VL client", lambda: OpenAI(api_key="EMPTY", base_url=f"http://{LLM_ADDR}:{LLM_PORT}/v1")
+        )
+
+    @property
+    def sam3(self):
+        """Returns the ``(model, processor)`` pair. Manually gated on HuggingFace."""
+        return self._get(
+            "SAM3",
+            lambda: (
+                Sam3Model.from_pretrained("facebook/sam3").to(self._device),
+                Sam3Processor.from_pretrained("facebook/sam3"),
+            ),
+        )
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--target_path", default=None, type=str, help="target path")
     parser.add_argument("--fov_x", default=120, type=float, help="panorama split fov x")
@@ -145,13 +200,20 @@ if __name__ == '__main__':
     parser.add_argument("--split_view_num", default=3, type=int, help="final split view num")
     parser.add_argument("--splitted_resolution", default=480, type=int, help="splitted resolution")
     parser.add_argument("--nframe", default=21, type=int, help="number of frames for trajectory generation")
-    parser.add_argument("--distance_threshold", default=0.1, type=float, help="distance threshold for obstacle avoidance")
+    parser.add_argument(
+        "--distance_threshold", default=0.1, type=float, help="distance threshold for obstacle avoidance"
+    )
     parser.add_argument("--obs_iteration_limit", default=3, type=int, help="obstacle avoidance iteration limit")
     parser.add_argument("--rotation_deg", default=120, type=float, help="rotation degree (left/right)")
     parser.add_argument("--rotation_up", default=45, type=float, help="rotation degree up")
     parser.add_argument("--up_right", default=60, type=float, help="rotation degree up-and-right")
     parser.add_argument("--obs_decay", default=2 / 3, type=float, help="obstacle decay factor")
-    parser.add_argument("--contract", default=8.0, type=float, help="depth contract factor, the overall depth range: [0, median_depth * contract * 2]")
+    parser.add_argument(
+        "--contract",
+        default=8.0,
+        type=float,
+        help="depth contract factor, the overall depth range: [0, median_depth * contract * 2]",
+    )
     parser.add_argument("--skip_exist", action="store_true", help="skip existing videos")
 
     # navigation params
@@ -164,7 +226,9 @@ if __name__ == '__main__':
     parser.add_argument("--traj_sim_threshold", type=float, default=0.7)
     parser.add_argument("--traj_sim_threshold_recon", type=float, default=0.7)
     parser.add_argument("--apply_up_route", action="store_true", help="Whether to render up views")
-    parser.add_argument("--apply_recon_iteration", action="store_true", help="Whether to apply reconstruction iteration")
+    parser.add_argument(
+        "--apply_recon_iteration", action="store_true", help="Whether to apply reconstruction iteration"
+    )
     parser.add_argument("--eloop_dist", type=float, default=0.25)
     parser.add_argument("--force_vlm", action="store_true", help="force VLM output")
 
@@ -197,26 +261,51 @@ if __name__ == '__main__':
     set_seed(args.seed)
 
     print("Models Initializing...")
-    zim_predictor = build_zim_model("vit_l", resolve_zim_checkpoint(), device=device)
-    gd_processor, gd_model = build_gd_model(resolve_gd_checkpoint(), device=device)
-
+    # MoGe is the only model every path needs, so it is the only one built up front.
     depth_model = MoGeModel.from_pretrained(MOGE_ID).to(device).eval()
-
-    # VLM & SAM3
-    client = OpenAI(api_key="EMPTY", base_url=f"http://{LLM_ADDR}:{LLM_PORT}/v1")
-    sam3_model = Sam3Model.from_pretrained("facebook/sam3").to(device)
-    sam3_processor = Sam3Processor.from_pretrained("facebook/sam3")
+    # ZIM, GroundingDINO, SAM3 and the VLM client are built on first use. Each is already
+    # guarded at its call site; building them here as well meant an indoor scene with
+    # cached metadata paid for four models it never calls, one of which is gated and hangs.
+    models = LazyModels(device)
     print("Models Initializing over.")
 
     # Near-view rotations used by regular trajectory generation.
     camera_candidates_near = [
-        {"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [-args.rotation_deg, 0], "name": "right-rotation"},
-        {"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [args.rotation_deg, 0], "name": "left-rotation"},
+        {
+            "type": "normal",
+            "backward-forward": 0,
+            "left-right": 0,
+            "rotation": [-args.rotation_deg, 0],
+            "name": "right-rotation",
+        },
+        {
+            "type": "normal",
+            "backward-forward": 0,
+            "left-right": 0,
+            "rotation": [args.rotation_deg, 0],
+            "name": "left-rotation",
+        },
     ]
     if args.up_right > 0:
-        camera_candidates_near.append({"type": "aerial", "backward-forward": 0, "left-right": 0, "rotation": [-args.up_right, -args.rotation_up], "name": "up-right-aerial"})
+        camera_candidates_near.append(
+            {
+                "type": "aerial",
+                "backward-forward": 0,
+                "left-right": 0,
+                "rotation": [-args.up_right, -args.rotation_up],
+                "name": "up-right-aerial",
+            }
+        )
     else:
-        camera_candidates_near.append({"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [0, -args.rotation_up], "name": "up-rotation"})
+        camera_candidates_near.append(
+            {
+                "type": "normal",
+                "backward-forward": 0,
+                "left-right": 0,
+                "rotation": [0, -args.rotation_up],
+                "name": "up-rotation",
+            }
+        )
 
     if os.path.exists(f"{args.target_path}/panorama.png"):
         scene_list = [args.target_path]  # single path VLM inference
@@ -224,16 +313,26 @@ if __name__ == '__main__':
         scene_list = glob(f"{args.target_path}/*")
 
     scene_list.sort()
-    scene_list = scene_list[args.node_rank::args.node_size]
+    scene_list = scene_list[args.node_rank :: args.node_size]
 
     for scene_path in tqdm(scene_list):
-
         # ======================================== Stage1: Regular Trajectory Generation ========================================
         if not args.skip_exist and os.path.exists(f"{scene_path}/render_results"):
             print(f"Delete existing {scene_path}/render_results")
             render_results_list = glob(f"{scene_path}/render_results/*")
-            render_results_list = [r for r in render_results_list if r.split('/')[-1] not in ("full_depth_prediction.pt", "global_mesh.ply",
-                                                                                              "global_normal.npy", "global_pcd.ply", "sky_mask.png", "sky_pcd.ply")]
+            render_results_list = [
+                r
+                for r in render_results_list
+                if r.split("/")[-1]
+                not in (
+                    "full_depth_prediction.pt",
+                    "global_mesh.ply",
+                    "global_normal.npy",
+                    "global_pcd.ply",
+                    "sky_mask.png",
+                    "sky_pcd.ply",
+                )
+            ]
             for path in render_results_list:
                 if os.path.isdir(path):
                     shutil.rmtree(path)
@@ -242,7 +341,11 @@ if __name__ == '__main__':
 
         print(f"Stage1: Start regular trajectory generation for scene: {scene_path.split('/')[-1]}")
 
-        image_path = f"{scene_path}/panorama_sr.png" if os.path.exists(f"{scene_path}/panorama_sr.png") else f"{scene_path}/panorama.png"
+        image_path = (
+            f"{scene_path}/panorama_sr.png"
+            if os.path.exists(f"{scene_path}/panorama_sr.png")
+            else f"{scene_path}/panorama.png"
+        )
 
         full_img = Image.open(image_path)
         if full_img.size[1] > 1920:
@@ -258,15 +361,29 @@ if __name__ == '__main__':
             base64_image = pil_image_to_base64(full_img)
             messages = [
                 {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": [
-                    {"type": "text", "text": get_qwen_caption_format("env_cls")},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
-                ]}
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": get_qwen_caption_format("env_cls")},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
+                    ],
+                },
             ]
             print(f"Qwen3-VL labeling meta information for {scene_path}...")
             with timer.track("Qwen3-VL labeling meta information"):
-                response = client.chat.completions.create(model=MODEL_NAME, messages=messages, max_tokens=1024, temperature=0.0, seed=1024)
-                clean_text = response.choices[0].message.content.strip().replace('[', '').replace(']', '').replace('"', '').replace("'", "").replace("```json", "").replace("```", "")
+                response = models.vlm.chat.completions.create(
+                    model=MODEL_NAME, messages=messages, max_tokens=1024, temperature=0.0, seed=1024
+                )
+                clean_text = (
+                    response.choices[0]
+                    .message.content.strip()
+                    .replace("[", "")
+                    .replace("]", "")
+                    .replace('"', "")
+                    .replace("'", "")
+                    .replace("```json", "")
+                    .replace("```", "")
+                )
             meta_info["scene_type"] = clean_text
             with open(f"{scene_path}/meta_info.json", "w") as write:
                 json.dump(meta_info, write, indent=2)
@@ -286,15 +403,21 @@ if __name__ == '__main__':
         else:
             with timer.track("Get sky mask"):
                 if meta_info["scene_type"] == "outdoor":
-                    sky_mask = torch.tensor(~get_zim_mask(full_img, "sky.", 0.3, 0.3, zim_predictor, gd_processor, gd_model, DEVICE=device))
+                    sky_mask = torch.tensor(
+                        ~get_zim_mask(full_img, "sky.", 0.3, 0.3, models.zim, *models.grounding_dino, DEVICE=device)
+                    )
                     # FIXME: Treat sky-dominant scenes as all non-sky for now.
                     if sky_mask.float().mean() > 0.9:
-                        rank0_log(f"Sky mask is too high for {scene_path} ({sky_mask.float().mean()}), set to all non-sky")
+                        rank0_log(
+                            f"Sky mask is too high for {scene_path} ({sky_mask.float().mean()}), set to all non-sky"
+                        )
                         sky_mask[:] = False
                 else:
                     sky_mask = torch.zeros((full_img.size[1], full_img.size[0])).bool()
             # save sky mask
-            transforms.ToPILImage()(((~sky_mask).float() * 255).to(torch.uint8)).save(f"{scene_path}/render_results/sky_mask.png")
+            transforms.ToPILImage()(((~sky_mask).float() * 255).to(torch.uint8)).save(
+                f"{scene_path}/render_results/sky_mask.png"
+            )
 
         # predict depth
         if os.path.exists(f"{scene_path}/render_results/full_depth_prediction.pt"):
@@ -302,7 +425,9 @@ if __name__ == '__main__':
         else:
             with timer.track("Predict panorama depth"):
                 full_depth = pred_pano_depth(depth_model, full_img)
-                edge_mask = torch.from_numpy(utils3d.numpy.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)).bool()
+                edge_mask = torch.from_numpy(
+                    utils3d.numpy.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)
+                ).bool()
                 sky_mask_for_depth = sky_mask
                 if sky_mask_for_depth.shape != edge_mask.shape:
                     sky_mask_for_depth = F.interpolate(
@@ -314,9 +439,13 @@ if __name__ == '__main__':
                 max_d = torch.quantile(full_depth["distance"][~full_mask], q=0.99).item()
                 full_depth["distance"] = torch.clip(full_depth["distance"], 0, max_d)
                 if args.contract is not None and meta_info.get("scene_type") == "outdoor":
-                    contract_distance = torch.median(full_depth["distance"].reshape(-1), dim=0)[0].item() * args.contract
+                    contract_distance = (
+                        torch.median(full_depth["distance"].reshape(-1), dim=0)[0].item() * args.contract
+                    )
                     contract_mask = full_depth["distance"] > contract_distance
-                    full_depth["distance"][contract_mask] = (2 * contract_distance) - (contract_distance ** 2 / (full_depth["distance"][contract_mask] + 1e-6))
+                    full_depth["distance"][contract_mask] = (2 * contract_distance) - (
+                        contract_distance**2 / (full_depth["distance"][contract_mask] + 1e-6)
+                    )
             with timer.track("[IO] Save panorama depth"):
                 torch.save(full_depth, f"{scene_path}/render_results/full_depth_prediction.pt")
         edge_mask = torch.from_numpy(utils3d.numpy.depth_edge(full_depth["distance"].cpu().numpy(), rtol=0.1)).bool()
@@ -344,7 +473,7 @@ if __name__ == '__main__':
                     distance=full_depth["distance"],
                     rays=full_depth["rays"],
                     excluded_region_mask=full_mask,
-                    dropout_pcd=False
+                    dropout_pcd=False,
                 )
             with timer.track("[IO] Save panorama pointcloud"):
                 global_pcd.export(f"{scene_path}/render_results/global_pcd.ply")
@@ -356,15 +485,21 @@ if __name__ == '__main__':
             with timer.track("Get panorama mesh"):
                 mesh_h, mesh_w = 960, 1920
                 img_resized = full_img.resize((mesh_w, mesh_h), resample=Image.Resampling.BICUBIC)
-                depth_resized = F.interpolate(full_depth['distance'][None, None], size=(mesh_h, mesh_w), mode='nearest')[0, 0]
-                rays_resized = F.interpolate(full_depth['rays'].permute(2, 0, 1)[None], size=(mesh_h, mesh_w), mode='bilinear')[0].permute(1, 2, 0)
-                mask_resized = F.interpolate(sky_mask.float()[None, None], size=(mesh_h, mesh_w), mode='nearest')[0, 0].bool()
+                depth_resized = F.interpolate(
+                    full_depth["distance"][None, None], size=(mesh_h, mesh_w), mode="nearest"
+                )[0, 0]
+                rays_resized = F.interpolate(
+                    full_depth["rays"].permute(2, 0, 1)[None], size=(mesh_h, mesh_w), mode="bilinear"
+                )[0].permute(1, 2, 0)
+                mask_resized = F.interpolate(sky_mask.float()[None, None], size=(mesh_h, mesh_w), mode="nearest")[
+                    0, 0
+                ].bool()
                 global_mesh = convert_rgbd2mesh_panorama(
                     rgb=torch.tensor(np.array(img_resized) / 255, dtype=torch.float32),
                     distance=depth_resized.to(device),
                     rays=rays_resized.to(device),
                     excluded_region_mask=mask_resized.to(device),
-                    device=device
+                    device=device,
                 )
             with timer.track("[IO] Save panorama mesh"):
                 o3d.io.write_triangle_mesh(f"{scene_path}/render_results/global_mesh.ply", global_mesh, compressed=True)
@@ -377,7 +512,7 @@ if __name__ == '__main__':
                 full_depth["distance"].cpu().numpy(),
                 full_depth["rays"].cpu().numpy(),
                 smooth_sigma=0.5,
-                facing_camera=True  # Keep normals facing the camera.
+                facing_camera=True,  # Keep normals facing the camera.
             )
             normal_map = normal_map[~full_mask.cpu().numpy()]
         with timer.track("[IO] Save panorama normal"):
@@ -388,13 +523,15 @@ if __name__ == '__main__':
             with timer.track("Get sky pointcloud"):
                 sky_depth = full_depth["distance"].clone()
                 sky_depth[sky_mask] = sky_depth.max()
-                sky_depth = smooth_sky_depth_boundary(sky_depth, sky_mask.to(device), transition_width=100, method="mean")
+                sky_depth = smooth_sky_depth_boundary(
+                    sky_depth, sky_mask.to(device), transition_width=100, method="mean"
+                )
                 sky_pcd = convert_rgbd2pcd_panorama(
                     rgb=torch.tensor(np.array(full_img) / 255, dtype=torch.float32),
                     distance=sky_depth,
                     rays=full_depth["rays"],
                     excluded_region_mask=~sky_mask.to(device),
-                    dropout_pcd=True
+                    dropout_pcd=True,
                 )
             with timer.track("[IO] Save sky pointcloud"):
                 sky_pcd.export(f"{scene_path}/render_results/sky_pcd.ply")
@@ -408,8 +545,12 @@ if __name__ == '__main__':
 
         # Sampling polar views
         with timer.track("Sampling polar views"):
-            polar_points = [np.array([-1, 0, 1.0], dtype=np.float32), np.array([-1, 0, -1.0], dtype=np.float32),
-                            np.array([0.1, 0, -1.0], dtype=np.float32), np.array([0.1, 0, 1.0], dtype=np.float32)]
+            polar_points = [
+                np.array([-1, 0, 1.0], dtype=np.float32),
+                np.array([-1, 0, -1.0], dtype=np.float32),
+                np.array([0.1, 0, -1.0], dtype=np.float32),
+                np.array([0.1, 0, 1.0], dtype=np.float32),
+            ]
             direct_points = polar_points.copy()
             rot_deg = 90
             N_view = int(360 / rot_deg)
@@ -419,12 +560,30 @@ if __name__ == '__main__':
             direct_points = np.stack(direct_points, axis=0)
             intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(args.fov_x), fov_y=np.deg2rad(args.fov_y))
             splitted_intrinsics = [intrinsics] * len(direct_points)
-            splitted_extrinsics = utils3d.numpy.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
+            splitted_extrinsics = utils3d.numpy.extrinsics_look_at(
+                np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])
+            ).astype(np.float32)
 
             # build polar bank
-            splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, interp=cv2.INTER_AREA)
-            splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, distance_to_depth=True)
-            splitted_masks = split_panorama_depth(~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w)
+            splitted_images = split_panorama_image(
+                np.array(full_img),
+                splitted_extrinsics,
+                splitted_intrinsics,
+                h=image_h,
+                w=image_w,
+                interp=cv2.INTER_AREA,
+            )
+            splitted_depths = split_panorama_depth(
+                np.array(full_depth["distance"].cpu()),
+                splitted_extrinsics,
+                splitted_intrinsics,
+                h=image_h,
+                w=image_w,
+                distance_to_depth=True,
+            )
+            splitted_masks = split_panorama_depth(
+                ~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w
+            )
 
         # save polar set
         save_tasks = []
@@ -445,13 +604,17 @@ if __name__ == '__main__':
                 bank_cameras[fname] = {"intrinsic": K.tolist(), "extrinsic": splitted_extrinsics[i].tolist()}
 
                 # Prepare data on the main thread before parallel IO.
-                save_tasks.append(('image', splitted_image, f"{scene_path}/render_results/polar_bank/images/{fname}.png"))
-                save_tasks.append(('depth', depth.cpu().numpy(), f"{scene_path}/render_results/polar_bank/depths/{fname}.png"))
+                save_tasks.append(
+                    ("image", splitted_image, f"{scene_path}/render_results/polar_bank/images/{fname}.png")
+                )
+                save_tasks.append(
+                    ("depth", depth.cpu().numpy(), f"{scene_path}/render_results/polar_bank/depths/{fname}.png")
+                )
 
             if save_tasks:
                 with ThreadPoolExecutor(max_workers=16) as executor:
                     futures = [
-                        executor.submit(save_image if task[0] == 'image' else save_depth, task[1], task[2])
+                        executor.submit(save_image if task[0] == "image" else save_depth, task[1], task[2])
                         for task in save_tasks
                     ]
                     for future in futures:
@@ -462,7 +625,11 @@ if __name__ == '__main__':
 
         # Sampling center view, and build memory bank for in this case
         with timer.track("Sampling panorama views"):
-            start_points = [np.array([-1, 0, 0], dtype=np.float32), np.array([-1, 0, 0.5], dtype=np.float32), np.array([-1, 0, -0.5], dtype=np.float32)]
+            start_points = [
+                np.array([-1, 0, 0], dtype=np.float32),
+                np.array([-1, 0, 0.5], dtype=np.float32),
+                np.array([-1, 0, -0.5], dtype=np.float32),
+            ]
             direct_points = start_points.copy()
             mid_indices = [0]
             rot_deg = 40
@@ -475,12 +642,30 @@ if __name__ == '__main__':
             direct_points = np.stack(direct_points, axis=0)
             intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(args.fov_x), fov_y=np.deg2rad(args.fov_y))
             splitted_intrinsics = [intrinsics] * len(direct_points)
-            splitted_extrinsics = utils3d.numpy.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
+            splitted_extrinsics = utils3d.numpy.extrinsics_look_at(
+                np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])
+            ).astype(np.float32)
 
             # build memory bank
-            splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, interp=cv2.INTER_AREA)
-            splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, distance_to_depth=True)
-            splitted_masks = split_panorama_depth(~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w)
+            splitted_images = split_panorama_image(
+                np.array(full_img),
+                splitted_extrinsics,
+                splitted_intrinsics,
+                h=image_h,
+                w=image_w,
+                interp=cv2.INTER_AREA,
+            )
+            splitted_depths = split_panorama_depth(
+                np.array(full_depth["distance"].cpu()),
+                splitted_extrinsics,
+                splitted_intrinsics,
+                h=image_h,
+                w=image_w,
+                distance_to_depth=True,
+            )
+            splitted_masks = split_panorama_depth(
+                ~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w
+            )
 
         save_tasks = []
         with timer.track("[IO] Save panorama views"):
@@ -500,13 +685,17 @@ if __name__ == '__main__':
                 K[1] *= image_h
                 bank_cameras[fname] = {"intrinsic": K.tolist(), "extrinsic": splitted_extrinsics[i].tolist()}
 
-                save_tasks.append(('image', splitted_image, f"{scene_path}/render_results/pano_bank/images/{fname}.png"))
-                save_tasks.append(('depth', depth.cpu().numpy(), f"{scene_path}/render_results/pano_bank/depths/{fname}.png"))
+                save_tasks.append(
+                    ("image", splitted_image, f"{scene_path}/render_results/pano_bank/images/{fname}.png")
+                )
+                save_tasks.append(
+                    ("depth", depth.cpu().numpy(), f"{scene_path}/render_results/pano_bank/depths/{fname}.png")
+                )
 
             if save_tasks:
                 with ThreadPoolExecutor(max_workers=16) as executor:
                     futures = [
-                        executor.submit(save_image if task[0] == 'image' else save_depth, task[1], task[2])
+                        executor.submit(save_image if task[0] == "image" else save_depth, task[1], task[2])
                         for task in save_tasks
                     ]
                     for future in futures:
@@ -538,11 +727,29 @@ if __name__ == '__main__':
             direct_points = np.stack(direct_points, axis=0)
             intrinsics = utils3d.numpy.intrinsics_from_fov(fov_x=np.deg2rad(args.fov_x), fov_y=np.deg2rad(args.fov_y))
             splitted_intrinsics = [intrinsics] * len(direct_points)
-            splitted_extrinsics = utils3d.numpy.extrinsics_look_at(np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])).astype(np.float32)
+            splitted_extrinsics = utils3d.numpy.extrinsics_look_at(
+                np.array([0, 0, 0]), direct_points, np.array([0, 0, 1])
+            ).astype(np.float32)
 
-            splitted_images = split_panorama_image(np.array(full_img), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, interp=cv2.INTER_AREA)
-            splitted_depths = split_panorama_depth(np.array(full_depth["distance"].cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w, distance_to_depth=True)
-            splitted_masks = split_panorama_depth(~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w)
+            splitted_images = split_panorama_image(
+                np.array(full_img),
+                splitted_extrinsics,
+                splitted_intrinsics,
+                h=image_h,
+                w=image_w,
+                interp=cv2.INTER_AREA,
+            )
+            splitted_depths = split_panorama_depth(
+                np.array(full_depth["distance"].cpu()),
+                splitted_extrinsics,
+                splitted_intrinsics,
+                h=image_h,
+                w=image_w,
+                distance_to_depth=True,
+            )
+            splitted_masks = split_panorama_depth(
+                ~np.array(full_mask.cpu()), splitted_extrinsics, splitted_intrinsics, h=image_h, w=image_w
+            )
 
         mesh = o3d.geometry.TriangleMesh()
         mesh.vertices = o3d.utility.Vector3dVector(np.asarray(global_mesh.vertices))
@@ -585,12 +792,14 @@ if __name__ == '__main__':
                 point_mask[projected_uv[:, 1], projected_uv[:, 0]] = 255
                 point_mask_img = Image.fromarray(point_mask)
 
-                view_data_list.append({
-                    'view_i': i,
-                    'c2w_start': c2w_start,
-                    'K': K,
-                    'median_depth': median_depth,
-                })
+                view_data_list.append(
+                    {
+                        "view_i": i,
+                        "c2w_start": c2w_start,
+                        "K": K,
+                        "median_depth": median_depth,
+                    }
+                )
 
                 io_save_tasks.append((i, scene_path, projected_pcd, point_mask_img, projected_uv, splitted_image))
 
@@ -604,10 +813,10 @@ if __name__ == '__main__':
         with timer.track("Plan regular trajectories"):
             total_trajectories = 0
             for view_data in tqdm(view_data_list, desc="Planning regular views"):
-                view_i = view_data['view_i']
-                c2w_start = view_data['c2w_start']
-                K = view_data['K']
-                median_depth = view_data['median_depth']
+                view_i = view_data["view_i"]
+                c2w_start = view_data["c2w_start"]
+                K = view_data["K"]
+                median_depth = view_data["median_depth"]
 
                 for trajectory_i, move in enumerate(camera_candidates_near):
                     camera_path = f"{scene_path}/render_results/view{view_i}/traj{trajectory_i}/camera.json"
@@ -615,7 +824,9 @@ if __name__ == '__main__':
                         continue
 
                     c2ws_next, obs_iteration = get_c2w(
-                        c2w_start.copy(), move, median_depth,
+                        c2w_start.copy(),
+                        move,
+                        median_depth,
                         air_bound=median_depth * 0.5,
                         n_inter=args.nframe - 1,
                         kdtree=kdtree,
@@ -623,7 +834,7 @@ if __name__ == '__main__':
                         distance_threshold=args.distance_threshold,
                         local_rank=0,
                         obs_decay=args.obs_decay,
-                        obs_limit=args.obs_iteration_limit
+                        obs_limit=args.obs_iteration_limit,
                     )
                     total_trajectories += 1
 
@@ -636,9 +847,15 @@ if __name__ == '__main__':
                     c2ws_next = np.concatenate([c2w_start[None], c2ws_next], axis=0)
 
                     for c2w in c2ws_next:
-                        add_scene_cam(scene, c2w, CAM_COLORS[trajectory_i % len(CAM_COLORS)], None,
-                                      args.splitted_resolution * 0.5, imsize=[image_w, image_h],
-                                      screen_width=median_depth * 0.15)
+                        add_scene_cam(
+                            scene,
+                            c2w,
+                            CAM_COLORS[trajectory_i % len(CAM_COLORS)],
+                            None,
+                            args.splitted_resolution * 0.5,
+                            imsize=[image_w, image_h],
+                            screen_width=median_depth * 0.15,
+                        )
 
                     w2cs = np.linalg.inv(c2ws_next)
                     Ks = np.array([K] * w2cs.shape[0])
@@ -648,15 +865,16 @@ if __name__ == '__main__':
                         "width": image_w,
                         "height": image_h,
                         "type": move["name"],
-                        "rotation_deg": np.sum(np.abs(move['rotation'])) * (args.obs_decay ** obs_iteration)
+                        "rotation_deg": np.sum(np.abs(move["rotation"])) * (args.obs_decay**obs_iteration),
                     }
 
                     with open(f"{scene_path}/render_results/view{view_i}/traj{trajectory_i}/camera.json", "w") as write:
                         json.dump(camera_info, write, indent=2)
             print(f"Total trajectory tasks: {total_trajectories}")
 
-        point = trimesh.PointCloud(vertices=np.array([0, 0, 0]).reshape(1, 3),
-                                   colors=np.array([255, 255, 255]).reshape(1, 3))
+        point = trimesh.PointCloud(
+            vertices=np.array([0, 0, 0]).reshape(1, 3), colors=np.array([255, 255, 255]).reshape(1, 3)
+        )
         scene.add_geometry(point)
         scene.export(f"{scene_path}/render_results/cameras.glb")
 
@@ -674,16 +892,33 @@ if __name__ == '__main__':
                     base64_image = pil_image_to_base64(full_img)
                     messages = [
                         {"role": "system", "content": "You are a robot navigation assistant."},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": get_navigation_instruction(args.force_vlm)},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
-                        ]}
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": get_navigation_instruction(args.force_vlm)},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}},
+                            ],
+                        },
                     ]
                     print(f"Qwen3-VL labeling for {scene_path}...")
                     with timer.track("Qwen3-VL labeling objects"):
-                        response = client.chat.completions.create(model=MODEL_NAME, messages=messages, max_tokens=1024, temperature=0.0, seed=1024)
-                        clean_text = response.choices[0].message.content.strip().replace('[', '').replace(']', '').replace('"', '').replace("'", "").replace("```json", "").replace("```", "").replace("-", "_")
-                        unique_objects = deduplicate_ordered([item.strip() for item in clean_text.split(',') if item.strip()])
+                        response = models.vlm.chat.completions.create(
+                            model=MODEL_NAME, messages=messages, max_tokens=1024, temperature=0.0, seed=1024
+                        )
+                        clean_text = (
+                            response.choices[0]
+                            .message.content.strip()
+                            .replace("[", "")
+                            .replace("]", "")
+                            .replace('"', "")
+                            .replace("'", "")
+                            .replace("```json", "")
+                            .replace("```", "")
+                            .replace("-", "_")
+                        )
+                        unique_objects = deduplicate_ordered(
+                            [item.strip() for item in clean_text.split(",") if item.strip()]
+                        )
                     with open(os.path.join(scene_path, "objects.json"), "w") as f:
                         json.dump(unique_objects, f, indent=4)
                 except Exception as e:
@@ -701,9 +936,14 @@ if __name__ == '__main__':
                 seen_pairs = set()
 
                 print(f"SAM3 process for {scene_path}...")
+                # Resolved here, inside the guard that decides SAM3 is needed at all, and
+                # once rather than per batch.
+                sam3_model, sam3_processor = models.sam3
                 for i in range(0, len(unique_objects), SAM_BATCH_SIZE):
-                    batch_objects = unique_objects[i: i + SAM_BATCH_SIZE]
-                    batch_objects = [obj for obj in batch_objects if len(obj.split()) < 8 and obj.lower() not in ("sun")]
+                    batch_objects = unique_objects[i : i + SAM_BATCH_SIZE]
+                    batch_objects = [
+                        obj for obj in batch_objects if len(obj.split()) < 8 and obj.lower() not in ("sun")
+                    ]
                     batch_images = [full_img] * len(batch_objects)
                     if len(batch_objects) == 0:
                         continue
@@ -711,7 +951,12 @@ if __name__ == '__main__':
                         inputs = sam3_processor(images=batch_images, text=batch_objects, return_tensors="pt").to(device)
                         with torch.no_grad():
                             outputs = sam3_model(**inputs)
-                        results = sam3_processor.post_process_instance_segmentation(outputs, threshold=0.4, mask_threshold=0.5, target_sizes=[full_img.size[::-1]] * len(batch_objects))
+                        results = sam3_processor.post_process_instance_segmentation(
+                            outputs,
+                            threshold=0.4,
+                            mask_threshold=0.5,
+                            target_sizes=[full_img.size[::-1]] * len(batch_objects),
+                        )
 
                     no_cluster_num = 0
                     with timer.track("Processing object masks (filtering)"):
@@ -731,9 +976,12 @@ if __name__ == '__main__':
                             else:
                                 is_cluster_obj = False
 
-                            masks_np = masks.detach().cpu().numpy() if isinstance(masks, torch.Tensor) else np.array(masks)
+                            masks_np = (
+                                masks.detach().cpu().numpy() if isinstance(masks, torch.Tensor) else np.array(masks)
+                            )
                             scores_np = scores.detach().cpu().numpy() if scores is not None else [0.0] * len(masks)
-                            if masks_np.ndim == 2: masks_np = masks_np[None, ...]
+                            if masks_np.ndim == 2:
+                                masks_np = masks_np[None, ...]
 
                             for m_k, mask in enumerate(masks_np):
                                 area = np.sum(mask)
@@ -744,36 +992,44 @@ if __name__ == '__main__':
                                 mask_upper = np.min(np.where(mask == 1)[0])
                                 mask_lower = np.max(np.where(mask == 1)[0])
                                 if mask_upper > mask.shape[0] * 0.6 or mask_lower < mask.shape[0] * 0.4:
-                                    print(f"Mask low ~ high from {current_obj_name}: ({mask_upper / mask.shape[0]}~{mask_lower / mask.shape[0]}), skipping")
+                                    print(
+                                        f"Mask low ~ high from {current_obj_name}: ({mask_upper / mask.shape[0]}~{mask_lower / mask.shape[0]}), skipping"
+                                    )
                                     continue
 
                                 mask_left_bound = np.min(np.where(mask == 1)[1])
                                 mask_right_bound = np.max(np.where(mask == 1)[1])
                                 if (mask_right_bound - mask_left_bound) > mask.shape[1] * 0.75:
-                                    print(f"Mask width from {current_obj_name} is too wide: ({(mask_right_bound - mask_left_bound) / mask.shape[1]}), skipping")
+                                    print(
+                                        f"Mask width from {current_obj_name} is too wide: ({(mask_right_bound - mask_left_bound) / mask.shape[1]}), skipping"
+                                    )
                                     continue
 
-                                batch_candidates.append({
-                                    "mask": mask,
-                                    "area": area,
-                                    "label": current_obj_name,
-                                    "score": float(scores_np[m_k]),
-                                    "is_cluster_obj": is_cluster_obj
-                                })
+                                batch_candidates.append(
+                                    {
+                                        "mask": mask,
+                                        "area": area,
+                                        "label": current_obj_name,
+                                        "score": float(scores_np[m_k]),
+                                        "is_cluster_obj": is_cluster_obj,
+                                    }
+                                )
                                 if not is_cluster_obj:
                                     no_cluster_num += 1
 
                         # Prefer individual objects when the batch has non-cluster candidates.
                         if no_cluster_num >= 1:
-                            print(f"Ignore cluster objects because of too many objects, {len(batch_candidates)} -> {no_cluster_num}.")
-                            batch_candidates = [cand for cand in batch_candidates if not cand['is_cluster_obj']]
+                            print(
+                                f"Ignore cluster objects because of too many objects, {len(batch_candidates)} -> {no_cluster_num}."
+                            )
+                            batch_candidates = [cand for cand in batch_candidates if not cand["is_cluster_obj"]]
 
-                        batch_candidates.sort(key=lambda x: x['area'], reverse=True)
+                        batch_candidates.sort(key=lambda x: x["area"], reverse=True)
 
                         for cand in batch_candidates:
-                            mask = cand['mask']
-                            label = cand['label']
-                            area = cand['area']
+                            mask = cand["mask"]
+                            label = cand["label"]
+                            area = cand["area"]
 
                             intersection = np.logical_and(mask, occupancy_map)
                             intersection_area = np.sum(intersection)
@@ -794,43 +1050,53 @@ if __name__ == '__main__':
                             seen_pairs.add((label, direction_label))
 
                             point_3d, depth_val = project_center_to_3d(
-                                center_2d,
-                                full_depth["distance"],
-                                full_depth["rays"],
-                                mask=mask,
-                                std_threshold=5.0
+                                center_2d, full_depth["distance"], full_depth["rays"], mask=mask, std_threshold=5.0
                             )
 
-                            (left_3d, left_2d), (right_3d, right_2d) = get_mask_edge_points_3d(mask, full_depth["distance"], full_depth["rays"])
+                            (left_3d, left_2d), (right_3d, right_2d) = get_mask_edge_points_3d(
+                                mask, full_depth["distance"], full_depth["rays"]
+                            )
                             bbox_scale, _, _ = get_max_size_center(mask, full_depth["distance"], full_depth["rays"])
 
                             if left_2d is not None and right_2d is not None:
                                 mid_x = (left_2d[0] + right_2d[0]) / 2
-                                edge_center_direction, edge_center_bearing = get_bearing_and_direction(mid_x, width_origin)
+                                edge_center_direction, edge_center_bearing = get_bearing_and_direction(
+                                    mid_x, width_origin
+                                )
                             elif left_2d is not None:
-                                edge_center_direction, edge_center_bearing = get_bearing_and_direction(left_2d[0], width_origin)
+                                edge_center_direction, edge_center_bearing = get_bearing_and_direction(
+                                    left_2d[0], width_origin
+                                )
                             elif right_2d is not None:
-                                edge_center_direction, edge_center_bearing = get_bearing_and_direction(right_2d[0], width_origin)
+                                edge_center_direction, edge_center_bearing = get_bearing_and_direction(
+                                    right_2d[0], width_origin
+                                )
                             else:
                                 # Fall back to the robust center when edge points are missing.
                                 edge_center_direction, edge_center_bearing = direction_label, bearing
 
-                            segmentation_data.append({
-                                "id": len(segmentation_data),
-                                "label": label,
-                                "score": float(cand['score']),
-                                "scale_3d": float(bbox_scale),
-                                "center_point_2d": center_2d.tolist() if isinstance(center_2d, np.ndarray) else center_2d,
-                                "direction": direction_label,
-                                "bearing_angle": float(bearing),
-                                "center_point_3d": point_3d.tolist() if isinstance(point_3d, np.ndarray) else point_3d,
-                                "depth_distance": float(depth_val),
-                                "mask_area": mask.mean(),
-                                "left_point_3d": left_3d,
-                                "right_point_3d": right_3d,
-                                "edge_center_direction": edge_center_direction,
-                                "edge_center_bearing": float(edge_center_bearing)
-                            })
+                            segmentation_data.append(
+                                {
+                                    "id": len(segmentation_data),
+                                    "label": label,
+                                    "score": float(cand["score"]),
+                                    "scale_3d": float(bbox_scale),
+                                    "center_point_2d": center_2d.tolist()
+                                    if isinstance(center_2d, np.ndarray)
+                                    else center_2d,
+                                    "direction": direction_label,
+                                    "bearing_angle": float(bearing),
+                                    "center_point_3d": point_3d.tolist()
+                                    if isinstance(point_3d, np.ndarray)
+                                    else point_3d,
+                                    "depth_distance": float(depth_val),
+                                    "mask_area": mask.mean(),
+                                    "left_point_3d": left_3d,
+                                    "right_point_3d": right_3d,
+                                    "edge_center_direction": edge_center_direction,
+                                    "edge_center_bearing": float(edge_center_bearing),
+                                }
+                            )
 
                             valid_masks_vis.append(mask)
                             valid_labels_vis.append(label)
@@ -843,17 +1109,32 @@ if __name__ == '__main__':
 
                 if valid_masks_vis:
                     vis_path = f"{scene_path}/render_results/segmentation_vis.png"
-                    save_visualization(full_img, np.array(valid_masks_vis), valid_labels_vis, valid_directions_vis, vis_path)
+                    save_visualization(
+                        full_img, np.array(valid_masks_vis), valid_labels_vis, valid_directions_vis, vis_path
+                    )
                     print(f"Saved visualization to {vis_path}")
 
                 with timer.track("[IO] Save combined_with_markers.ply"):
                     if segmentation_data:
-                        create_and_save_combined_pcd(global_pcd, segmentation_data, os.path.join(scene_path, "render_results", "combined_with_markers.ply"))
+                        create_and_save_combined_pcd(
+                            global_pcd,
+                            segmentation_data,
+                            os.path.join(scene_path, "render_results", "combined_with_markers.ply"),
+                        )
 
             # NavMesh & Paths
             try:
-                is_outdoor = (meta_info.get("scene_type") == "outdoor")
-                process_single_scene(scene_path, scene_path.split('/')[-1], global_mesh, args, segmentation_data, global_median_depth, is_outdoor=is_outdoor, timer=timer)
+                is_outdoor = meta_info.get("scene_type") == "outdoor"
+                process_single_scene(
+                    scene_path,
+                    scene_path.split("/")[-1],
+                    global_mesh,
+                    args,
+                    segmentation_data,
+                    global_median_depth,
+                    is_outdoor=is_outdoor,
+                    timer=timer,
+                )
             except Exception as e:
                 rank0_log(f"  Navmesh Error: {e}", "ERROR")
 
@@ -888,12 +1169,12 @@ if __name__ == '__main__':
                     with open(f"{scene_path}/navmesh/reconstruct_pairs.json", "r") as f:
                         reconstruct_data = json.load(f)
                     for item in reconstruct_data:
-                        if 'camera_path' in item:
-                            del item['camera_path']
+                        if "camera_path" in item:
+                            del item["camera_path"]
                     surround_data = copy.deepcopy(seg_data)
                     for item in surround_data:
-                        if 'camera_path' in item:
-                            del item['camera_path']
+                        if "camera_path" in item:
+                            del item["camera_path"]
 
                 except Exception as e:
                     rank0_log(f"Warning: Failed to load segmentation labels: {e}", "ERROR")
@@ -906,7 +1187,6 @@ if __name__ == '__main__':
             ]
 
             for task_name, json_path, out_prefix in render_tasks:
-
                 if not os.path.exists(json_path):
                     continue
 
@@ -1002,7 +1282,7 @@ if __name__ == '__main__':
                             smoothing=0.2 if task_name == "reconstruct" else 0.5,
                             world_up=np.array([0, 0, 1]),
                             look_at_target=target_center_3d,
-                            is_recon=(task_name == "reconstruct")
+                            is_recon=(task_name == "reconstruct"),
                         )
 
                         if len(c2ws_batch) == 0:
@@ -1048,31 +1328,41 @@ if __name__ == '__main__':
                             min_angle_thresh=np.deg2rad(args.min_angle_threshold),
                             min_length_ratio=0.2,
                             length_weight=0.3,
-                            diversity_weight=0.7
+                            diversity_weight=0.7,
                         )
-                        filtered_indices = filtered_indices[:args.wonder_topk]
+                        filtered_indices = filtered_indices[: args.wonder_topk]
                         topk_paths = [origin_paths[i] for i in filtered_indices]
                         folder_names = [folder_names[i] for i in filtered_indices]
                         path_vis_list = [path_vis_list[i] for i in filtered_indices]
-                        processed_c2ws = process_trajectories(topk_paths, move_threshold, args.nframe, smoothing=0.5, world_up=np.array([0, 0, 1]))
+                        processed_c2ws = process_trajectories(
+                            topk_paths, move_threshold, args.nframe, smoothing=0.5, world_up=np.array([0, 0, 1])
+                        )
                     else:
                         processed_paths = np.array(processed_c2ws)
-                        path_sim_matrix = compute_trajectory_similarity_matrix(processed_paths, pos_scale=median_depth, rot_scale_deg=20.0, weights=(0.75, 0.25))
+                        path_sim_matrix = compute_trajectory_similarity_matrix(
+                            processed_paths, pos_scale=median_depth, rot_scale_deg=20.0, weights=(0.75, 0.25)
+                        )
                         path_sim_matrix[np.triu_indices(path_sim_matrix.shape[0])] = 0
                         filtered_indices = np.where(np.max(path_sim_matrix, axis=1) < args.traj_sim_threshold)[0]
                         processed_c2ws = [processed_c2ws[i] for i in filtered_indices]
                         folder_names = [folder_names[i] for i in filtered_indices]
                         path_vis_list = [path_vis_list[i] for i in filtered_indices]
                         processed_seg_list = [processed_seg_list[i] for i in filtered_indices]
-                        print(f"Task {task_name}: Filtered {processed_paths.shape[0]} -> {len(processed_c2ws)} trajectories")
+                        print(
+                            f"Task {task_name}: Filtered {processed_paths.shape[0]} -> {len(processed_c2ws)} trajectories"
+                        )
                         if task_name == "reconstruct" and len(processed_c2ws) > args.recon_topk:
                             print(f"Task {task_name}: Using FPS to select {args.recon_topk} diverse trajectories")
-                            processed_seg_list, fps_indices = select_reconstruct_via_fps(processed_seg_list, args.recon_topk)
+                            processed_seg_list, fps_indices = select_reconstruct_via_fps(
+                                processed_seg_list, args.recon_topk
+                            )
                             processed_c2ws = [processed_c2ws[i] for i in fps_indices]
                             folder_names = [folder_names[i] for i in fps_indices]
                             path_vis_list = [path_vis_list[i] for i in fps_indices]
                         elif len(processed_c2ws) > args.recon_topk:
-                            print(f"Task {task_name}: Filtered {len(processed_c2ws)} -> {args.recon_topk} trajectories with topk filtering")
+                            print(
+                                f"Task {task_name}: Filtered {len(processed_c2ws)} -> {args.recon_topk} trajectories with topk filtering"
+                            )
                             processed_seg_list, sorted_indices = get_topk_seg_data(processed_seg_list, args.recon_topk)
                             processed_c2ws = [processed_c2ws[i] for i in sorted_indices]
                             folder_names = [folder_names[i] for i in sorted_indices]
@@ -1088,7 +1378,9 @@ if __name__ == '__main__':
                     K_pano = K.astype(np.float64)
                     K_pano[0, :] /= image_w
                     K_pano[1, :] /= image_h
-                    splitted_images = split_panorama_image(np.array(full_img), w2cs[0:1], np.array([K_pano]), h=image_h, w=image_w, interp=cv2.INTER_AREA)
+                    splitted_images = split_panorama_image(
+                        np.array(full_img), w2cs[0:1], np.array([K_pano]), h=image_h, w=image_w, interp=cv2.INTER_AREA
+                    )
 
                     out_dir = f"{scene_path}/render_results/{folder_name}/traj0"
                     os.makedirs(out_dir, exist_ok=True)
@@ -1104,26 +1396,33 @@ if __name__ == '__main__':
                         "width": image_w,
                         "height": image_h,
                         "intrinsic": [K.tolist()] * len(w2cs),
-                        "extrinsic": w2cs.tolist()
+                        "extrinsic": w2cs.tolist(),
                     }
 
                     with open(f"{out_dir}/camera.json", "w") as write:
                         json.dump(camera_info, write, indent=2)
 
                     for c2w in c2ws:
-                        add_scene_cam(scene, c2w, CAM_COLORS[trajectory_i % len(CAM_COLORS)], None, image_h * 0.5,
-                                      imsize=[image_w, image_h], screen_width=median_depth * 0.15)
+                        add_scene_cam(
+                            scene,
+                            c2w,
+                            CAM_COLORS[trajectory_i % len(CAM_COLORS)],
+                            None,
+                            image_h * 0.5,
+                            imsize=[image_w, image_h],
+                            screen_width=median_depth * 0.15,
+                        )
                     trajectory_i += 1
 
                     if task_name == "target":
                         if i < len(seg_data):
-                            seg_data[i]['camera_path'] = camera_info
+                            seg_data[i]["camera_path"] = camera_info
                     elif task_name == "surround":
                         if i < len(surround_data):
-                            surround_data[i]['camera_path'] = camera_info
+                            surround_data[i]["camera_path"] = camera_info
                     elif task_name == "reconstruct":
                         if i < len(reconstruct_data):
-                            reconstruct_data[i]['camera_path'] = camera_info
+                            reconstruct_data[i]["camera_path"] = camera_info
                     elif task_name == "exploration":
                         camera_info["direction"] = wonder_direction_label
                         wonder_camera_data[i] = camera_info
@@ -1141,20 +1440,42 @@ if __name__ == '__main__':
                             while (min_distance < distance_threshold or max_xy_angle > 75) and obs_iteration < 4:
                                 if obs_iteration > 0:
                                     if min_distance < distance_threshold:
-                                        rank0_log(f"Obstruction is detected in aerial routes min distance: {min_distance} reduce the rot_deg {up_rot_deg}->{up_rot_deg * obs_decay}")
+                                        rank0_log(
+                                            f"Obstruction is detected in aerial routes min distance: {min_distance} reduce the rot_deg {up_rot_deg}->{up_rot_deg * obs_decay}"
+                                        )
                                     elif max_xy_angle > 75:
-                                        rank0_log(f"Abnormal is detected in aerial routes max xy angle: {max_xy_angle} reduce the rot_deg {up_rot_deg}->{up_rot_deg * obs_decay}")
+                                        rank0_log(
+                                            f"Abnormal is detected in aerial routes max xy angle: {max_xy_angle} reduce the rot_deg {up_rot_deg}->{up_rot_deg * obs_decay}"
+                                        )
                                     up_rot_deg = up_rot_deg * obs_decay
 
-                                rise_move = {"type": "normal", "backward-forward": 0, "left-right": 0, "rotation": [0, -up_rot_deg], "name": "up-rotation"}
+                                rise_move = {
+                                    "type": "normal",
+                                    "backward-forward": 0,
+                                    "left-right": 0,
+                                    "rotation": [0, -up_rot_deg],
+                                    "name": "up-rotation",
+                                }
                                 c2w0 = np.linalg.inv(w2cs[0])
 
-                                c2ws_next, obs_iteration_inner = get_c2w(c2w0, rise_move, median_depth, air_bound=median_depth * 0.5, n_inter=args.nframe // 2,
-                                                                         kdtree=kdtree, distance_threshold=distance_threshold, local_rank=0, obs_decay=obs_decay)
-                                up_rot_deg = up_rot_deg * (obs_decay ** obs_iteration_inner)
+                                c2ws_next, obs_iteration_inner = get_c2w(
+                                    c2w0,
+                                    rise_move,
+                                    median_depth,
+                                    air_bound=median_depth * 0.5,
+                                    n_inter=args.nframe // 2,
+                                    kdtree=kdtree,
+                                    distance_threshold=distance_threshold,
+                                    local_rank=0,
+                                    obs_decay=obs_decay,
+                                )
+                                up_rot_deg = up_rot_deg * (obs_decay**obs_iteration_inner)
 
                                 if up_rot_deg < 15:
-                                    rank0_log(f"Too many collisions are detected in the whole aerial routes, ignore...", "WARNING")
+                                    rank0_log(
+                                        f"Too many collisions are detected in the whole aerial routes, ignore...",
+                                        "WARNING",
+                                    )
                                     success_aerial = False
                                     break
 
@@ -1166,9 +1487,14 @@ if __name__ == '__main__':
                                 c2w_rise_next[:3, 3] = c2ws_rise[-1, :3, 3]
                                 c2w_rise_next = np.tile(c2w_rise_next[None], [offsets.shape[0], 1, 1])  # [N-1,4,4]
                                 c2w_rise_next[:, :3, 3] += offsets
-                                rise_R = np.array([[1, 0, 0],
-                                                   [0, np.cos(-np.deg2rad(up_rot_deg)), -np.sin(-np.deg2rad(up_rot_deg))],
-                                                   [0, np.sin(-np.deg2rad(up_rot_deg)), np.cos(-np.deg2rad(up_rot_deg))]], dtype=np.float32)
+                                rise_R = np.array(
+                                    [
+                                        [1, 0, 0],
+                                        [0, np.cos(-np.deg2rad(up_rot_deg)), -np.sin(-np.deg2rad(up_rot_deg))],
+                                        [0, np.sin(-np.deg2rad(up_rot_deg)), np.cos(-np.deg2rad(up_rot_deg))],
+                                    ],
+                                    dtype=np.float32,
+                                )
                                 c2w_rise_next[:, :3, :3] = c2w_Rs @ rise_R[None]
                                 c2ws_rise = np.concatenate([c2ws_rise, c2w_rise_next], axis=0)
 
@@ -1208,8 +1534,15 @@ if __name__ == '__main__':
                             json.dump(camera_info_rise, write, indent=2)
 
                         for c2w in c2ws_rise:
-                            add_scene_cam(scene, c2w, CAM_COLORS[trajectory_i % len(CAM_COLORS)], None, image_h * 0.5,
-                                          imsize=[image_w, image_h], screen_width=median_depth * 0.15)
+                            add_scene_cam(
+                                scene,
+                                c2w,
+                                CAM_COLORS[trajectory_i % len(CAM_COLORS)],
+                                None,
+                                image_h * 0.5,
+                                imsize=[image_w, image_h],
+                                screen_width=median_depth * 0.15,
+                            )
                         trajectory_i += 1
 
                     # Build optional reconstruct-aware eloop iteration.
@@ -1219,17 +1552,29 @@ if __name__ == '__main__':
                             c2w0 = c2ws[-1].copy()
                             w2c0 = np.linalg.inv(c2w0)
                             # Render depth from the target view to estimate local scale.
-                            _, guided_depth = point_rendering(K=torch.from_numpy(K[None]).to(device=device, dtype=torch.float32),
-                                                              w2cs=torch.from_numpy(w2c0[None]).to(device=device, dtype=torch.float32),
-                                                              points=global_pcd.vertices, colors=torch.zeros((global_pcd.vertices.shape[0], 3), device=device, dtype=torch.float32),
-                                                              h=image_h, w=image_w, render_radius=0.008, points_per_pixel=8,
-                                                              device=device, background_color=[0, 0, 0], return_depth=True)
+                            _, guided_depth = point_rendering(
+                                K=torch.from_numpy(K[None]).to(device=device, dtype=torch.float32),
+                                w2cs=torch.from_numpy(w2c0[None]).to(device=device, dtype=torch.float32),
+                                points=global_pcd.vertices,
+                                colors=torch.zeros(
+                                    (global_pcd.vertices.shape[0], 3), device=device, dtype=torch.float32
+                                ),
+                                h=image_h,
+                                w=image_w,
+                                render_radius=0.008,
+                                points_per_pixel=8,
+                                device=device,
+                                background_color=[0, 0, 0],
+                                return_depth=True,
+                            )
                             guided_depth = guided_depth[0, 0]
                             guided_depth[guided_depth == -1] = 0
                             median_depth = torch.median(guided_depth[guided_depth > 0]).item()
 
                             c2ws_eloop, obs_iteration = get_c2w(
-                                c2w0.copy(), eloop_move, median_depth,
+                                c2w0.copy(),
+                                eloop_move,
+                                median_depth,
                                 air_bound=median_depth * 0.5,
                                 n_inter=args.nframe - 1,
                                 kdtree=kdtree,
@@ -1237,7 +1582,7 @@ if __name__ == '__main__':
                                 distance_threshold=args.distance_threshold,
                                 local_rank=0,
                                 obs_decay=args.obs_decay,
-                                obs_limit=args.obs_iteration_limit
+                                obs_limit=args.obs_iteration_limit,
                             )
 
                             c2ws_eloop = interpolate_poses(c2ws_eloop[1:], M=args.nframe - 1)
@@ -1251,7 +1596,7 @@ if __name__ == '__main__':
                                 "height": image_h,
                                 "intrinsic": [K.tolist()] * len(w2cs_eloop),
                                 "extrinsic": w2cs_eloop.tolist(),
-                                "eloop_rotation": 0.5 * ((args.obs_decay) ** obs_iteration)
+                                "eloop_rotation": 0.5 * ((args.obs_decay) ** obs_iteration),
                             }
 
                             os.makedirs(f"{scene_path}/render_results/{folder_name}/traj1", exist_ok=True)
@@ -1259,13 +1604,21 @@ if __name__ == '__main__':
                                 json.dump(camera_info_eloop, write, indent=2)
 
                             for c2w in c2ws_eloop:
-                                add_scene_cam(scene, c2w, CAM_COLORS[trajectory_i % len(CAM_COLORS)], None, image_h * 0.5,
-                                              imsize=[image_w, image_h], screen_width=median_depth * 0.15)
+                                add_scene_cam(
+                                    scene,
+                                    c2w,
+                                    CAM_COLORS[trajectory_i % len(CAM_COLORS)],
+                                    None,
+                                    image_h * 0.5,
+                                    imsize=[image_w, image_h],
+                                    screen_width=median_depth * 0.15,
+                                )
                             trajectory_i += 1
 
             # Save camera visualization.
-            point = trimesh.PointCloud(vertices=np.array([0, 0, 0]).reshape(1, 3),
-                                       colors=np.array([255, 255, 255]).reshape(1, 3))
+            point = trimesh.PointCloud(
+                vertices=np.array([0, 0, 0]).reshape(1, 3), colors=np.array([255, 255, 255]).reshape(1, 3)
+            )
             scene.add_geometry(point)
             scene.export(f"{scene_path}/render_results/cameras_navi.glb")
 
