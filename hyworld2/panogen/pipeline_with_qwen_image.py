@@ -62,22 +62,22 @@ GENERAL_NEGATIVE_PROMPT = (
 # Utility functions
 # ============================================================
 
+
 def circular_blend_edges(image: Image.Image, blend_width: int = 32) -> Image.Image:
     """Blend the left and right edges of an image for seamless panorama."""
     arr = np.array(image)
     for x in range(blend_width):
-        arr[:, x, :] = (
-            arr[:, -blend_width + x, :] * (1 - x / blend_width)
-            + arr[:, x, :] * (x / blend_width)
-        )
+        arr[:, x, :] = arr[:, -blend_width + x, :] * (1 - x / blend_width) + arr[:, x, :] * (x / blend_width)
     return Image.fromarray(arr[:, :-blend_width].astype(np.uint8))
 
 
 def set_reproducibility(enable: bool, global_seed=None, benchmark=None):
     if enable:
         import random
+
         random.seed(global_seed)
         import numpy as np
+
         np.random.seed(global_seed)
         torch.manual_seed(global_seed)
     if enable:
@@ -90,6 +90,7 @@ def set_reproducibility(enable: bool, global_seed=None, benchmark=None):
 # ============================================================
 # Pipeline
 # ============================================================
+
 
 class HunyuanPanoPipeline:
     """HunyuanImage panorama pipeline backed by Qwen-Image-Edit.
@@ -122,6 +123,7 @@ class HunyuanPanoPipeline:
         lora_subfolder: str = DEFAULT_LORA_SUBFOLDER,
         torch_dtype: torch.dtype = torch.bfloat16,
         cpu_offload: bool = False,
+        offload: str = "none",
     ) -> "HunyuanPanoPipeline":
         """Load model weights (and LoRA) and return a ready-to-use pipeline.
 
@@ -138,31 +140,33 @@ class HunyuanPanoPipeline:
                 that contains the LoRA weights file.  Ignored when
                 ``lora_path`` is ``None``.
             torch_dtype: Torch dtype for the model. Defaults to bfloat16.
-            cpu_offload: Stream components to the GPU as they are called, instead of
-                holding the whole 53.76 GiB pipeline resident. Required below 80 GB.
+            cpu_offload: Deprecated alias for ``offload="model"``.
+            offload: Weight placement strategy.
+
+                * ``"none"`` -- the whole 53.76 GiB pipeline resident. Needs 80 GB.
+                * ``"model"`` -- one component at a time. Needs a card larger than the
+                  largest component, which for this pipeline is 40 GB of transformer.
+                * ``"sequential"`` -- one submodule at a time. Fits a 40 GB card, and is
+                  the only mode that does.
         """
+        if cpu_offload and offload == "none":
+            offload = "model"
+        if offload not in ("none", "model", "sequential"):
+            raise ValueError(f"offload must be none, model or sequential; got {offload!r}")
+
         print(f"[Init] Loading base model from {pretrained_model_name_or_path} ...")
         pipe = PanoDiffusionPipeline.from_pretrained(
             pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
         )
-        # Qwen-Image-Edit-2509 is 53.76 GiB in bf16 -- 20.43B of transformer plus 8.29B of
-        # text encoder. `.to("cuda")` unconditionally therefore requires an 80 GB card, and
-        # on anything smaller it fails before the LoRA is even loaded. That is a placement
-        # decision baked into the loader rather than a real hardware floor: diffusers can
-        # stream whole components on and off as the pipeline calls them.
-        #
-        # enable_model_cpu_offload keeps only the component currently executing resident,
-        # so the peak is the largest single component rather than their sum. It is slower
-        # by the cost of moving weights across PCIe once per component per inference, which
-        # for a 40-step panorama is a small fraction of the total.
-        if cpu_offload:
-            print("[Init] CPU offload enabled: components stream to GPU as they are called.")
-            pipe.enable_model_cpu_offload()
-        else:
-            pipe = pipe.to("cuda")
         print("[Init] Base model loaded successfully!")
 
+        # LoRA before placement, not after, and this ordering is load-bearing for
+        # `sequential`. Sequential offload installs accelerate hooks that replace each
+        # submodule's parameters with meta tensors restored on demand, so weights arriving
+        # afterwards have nothing stable to merge into. Loading while everything is still
+        # ordinary CPU tensors works for all three modes, so it is done unconditionally
+        # rather than branched on.
         if lora_path is not None:
             print(f"[Init] Loading LoRA weights from {lora_path} (subfolder={lora_subfolder}) ...")
             pipe.load_lora_weights(
@@ -172,6 +176,30 @@ class HunyuanPanoPipeline:
                 torch_dtype=torch_dtype,
             )
             print("[Init] LoRA weights loaded successfully!")
+
+        # Qwen-Image-Edit-2509 is 53.76 GiB in bf16 -- 20.43B of transformer plus 8.29B of
+        # text encoder. `.to("cuda")` unconditionally therefore requires an 80 GB card. That
+        # is a placement decision baked into the loader rather than a real hardware floor:
+        # diffusers can stream weights on and off as the pipeline calls them.
+        #
+        # The two offload modes differ by granularity, and on a 40 GB card that difference
+        # decides whether this runs at all:
+        #
+        #   model      -- whole components. Peak is the largest ONE, and the transformer
+        #                 alone is ~40 GB, so this OOMs on an A100-40GB with 38.93 GiB
+        #                 allocated of 39.49, inside accelerate's own `module.to(device)`
+        #                 hook. Measured, run hypano-20260828-064043.
+        #   sequential -- individual submodules. Peak is one block, so it fits, at the cost
+        #                 of moving weights across PCIe once per submodule per forward.
+        #                 Slow, and the only thing that works below 80 GB.
+        if offload == "sequential":
+            print("[Init] Sequential CPU offload: submodules stream to GPU per forward.")
+            pipe.enable_sequential_cpu_offload()
+        elif offload == "model":
+            print("[Init] Model CPU offload: components stream to GPU as they are called.")
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to("cuda")
 
         return cls(pipe)
 
@@ -218,9 +246,7 @@ class HunyuanPanoPipeline:
             raise ValueError(f"Input image does not exist: {image}")
 
         # Build final prompts
-        full_positive = (
-            GENERAL_POSITIVE_PREFIX + prompt + GENERAL_POSITIVE_SUFFIX
-        ).strip()
+        full_positive = (GENERAL_POSITIVE_PREFIX + prompt + GENERAL_POSITIVE_SUFFIX).strip()
         full_negative = (GENERAL_NEGATIVE_PROMPT + " " + negative_prompt).strip()
 
         # Crop border to remove compression artefacts
@@ -259,53 +285,68 @@ class HunyuanPanoPipeline:
 # CLI
 # ============================================================
 
+
 def parse_args():
-    parser = argparse.ArgumentParser(
-        "Commandline arguments for running HunyuanPano (Qwen-Image-Edit backend) locally"
-    )
+    parser = argparse.ArgumentParser("Commandline arguments for running HunyuanPano (Qwen-Image-Edit backend) locally")
     # ---- per-inference ----
     parser.add_argument("--image", type=str, required=True, help="Path to the input image")
-    parser.add_argument("--prompt", type=str, default="",
-                        help="User prompt appended to the positive template")
-    parser.add_argument("--negative-prompt", type=str, default="",
-                        help="Additional negative prompt appended to the default")
+    parser.add_argument("--prompt", type=str, default="", help="User prompt appended to the positive template")
+    parser.add_argument(
+        "--negative-prompt", type=str, default="", help="Additional negative prompt appended to the default"
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--height", type=int, default=960,
-                        help="Height of the generated panorama image.")
-    parser.add_argument("--width", type=int, default=1952,
-                        help="Width of the generated panorama image.")
-    parser.add_argument("--num-inference-steps", type=int, default=40,
-                        help="Number of diffusion denoising steps.")
-    parser.add_argument("--guidance-scale", type=float, default=1.0,
-                        help="Classifier-free guidance scale.")
-    parser.add_argument("--true-cfg-scale", type=float, default=7.5,
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--blend-width", type=int, default=32,
-                        help="Pixel-space edge blending width for final post-process.")
-    parser.add_argument("--crop-border", type=float, default=0.0,
-                        help="Fraction of image border to crop before inference.")
+    parser.add_argument("--height", type=int, default=960, help="Height of the generated panorama image.")
+    parser.add_argument("--width", type=int, default=1952, help="Width of the generated panorama image.")
+    parser.add_argument("--num-inference-steps", type=int, default=40, help="Number of diffusion denoising steps.")
+    parser.add_argument("--guidance-scale", type=float, default=1.0, help="Classifier-free guidance scale.")
+    parser.add_argument("--true-cfg-scale", type=float, default=7.5, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--blend-width", type=int, default=32, help="Pixel-space edge blending width for final post-process."
+    )
+    parser.add_argument(
+        "--crop-border", type=float, default=0.0, help="Fraction of image border to crop before inference."
+    )
 
     # ---- model init ----
-    parser.add_argument("--pretrained-model-name-or-path", type=str,
-                        default=HunyuanPanoPipeline.DEFAULT_MODEL_ID,
-                        help="HuggingFace repo ID or local path to the base model")
-    parser.add_argument("--lora-path", type=str,
-                        default=HunyuanPanoPipeline.DEFAULT_LORA_PATH,
-                        help="Local path or HuggingFace repo ID for LoRA weights. "
-                             "Pass empty string to skip.")
-    parser.add_argument("--lora-subfolder", type=str,
-                        default=HunyuanPanoPipeline.DEFAULT_LORA_SUBFOLDER,
-                        help="Subfolder inside --lora-path that contains the LoRA weights file.")
+    parser.add_argument(
+        "--pretrained-model-name-or-path",
+        type=str,
+        default=HunyuanPanoPipeline.DEFAULT_MODEL_ID,
+        help="HuggingFace repo ID or local path to the base model",
+    )
+    parser.add_argument(
+        "--lora-path",
+        type=str,
+        default=HunyuanPanoPipeline.DEFAULT_LORA_PATH,
+        help="Local path or HuggingFace repo ID for LoRA weights. Pass empty string to skip.",
+    )
+    parser.add_argument(
+        "--lora-subfolder",
+        type=str,
+        default=HunyuanPanoPipeline.DEFAULT_LORA_SUBFOLDER,
+        help="Subfolder inside --lora-path that contains the LoRA weights file.",
+    )
 
     # ---- main-only ----
-    parser.add_argument("--save", type=str, default=None,
-                        help="Path to save the generated image "
-                             "(default: <input_stem>_panorama.png)")
-    parser.add_argument("--cpu-offload", action="store_true",
-                        help="Stream pipeline components to the GPU as they are called. The bf16 base is "
-                             "53.76 GiB, so this is required on any card below 80 GB.")
-    parser.add_argument("--reproduce", action="store_true",
-                        help="Whether to reproduce the results (fix all RNGs)")
+    parser.add_argument(
+        "--save", type=str, default=None, help="Path to save the generated image (default: <input_stem>_panorama.png)"
+    )
+    parser.add_argument(
+        "--cpu-offload",
+        action="store_true",
+        help="Deprecated alias for --offload model.",
+    )
+    parser.add_argument(
+        "--offload",
+        choices=("none", "model", "sequential"),
+        default="none",
+        help="Weight placement. 'none' holds the whole 53.76 GiB pipeline resident and "
+        "needs 80 GB. 'model' streams whole components, so it needs a card larger than "
+        "the largest one -- the transformer is ~40 GB, which is why this still OOMs on an "
+        "A100-40GB. 'sequential' streams individual submodules and is the only mode that "
+        "fits 40 GB, at the cost of PCIe traffic per forward.",
+    )
+    parser.add_argument("--reproduce", action="store_true", help="Whether to reproduce the results (fix all RNGs)")
 
     return parser.parse_args()
 
@@ -321,6 +362,7 @@ def main(args):
         lora_path=args.lora_path if args.lora_path else None,
         lora_subfolder=args.lora_subfolder,
         cpu_offload=args.cpu_offload,
+        offload=args.offload,
     )
 
     # Run inference
