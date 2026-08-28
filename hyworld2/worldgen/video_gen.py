@@ -17,7 +17,7 @@ from transformers import Sam3VideoModel, Sam3VideoProcessor
 from models.worldstereo_wrapper import WorldStereo
 from src.data_utils import sort_trajs, load_mutli_traj_dataset
 from src.general_utils import set_seed, load_video, rank0_log, Timer
-from src.retrieval_wm import PanoramaMemoryBank
+from src.retrieval_wm import LazyModel, PanoramaMemoryBank
 from src.sp_utils.parallel_states import initialize_parallel_state
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -26,11 +26,16 @@ timer = Timer()
 SAM3_REPO_ID = "facebook/sam3"
 MOGE_ID = "Ruicheng/moge-2-vitl-normal"
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # == parse configs ==
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_type", type=str, default="worldstereo-memory-dmd", choices=["worldstereo-memory", "worldstereo-memory-dmd"],
-                        help="Model type (e.g., 'worldstereo-memory', 'worldstereo-memory-dmd')")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="worldstereo-memory-dmd",
+        choices=["worldstereo-memory", "worldstereo-memory-dmd"],
+        help="Model type (e.g., 'worldstereo-memory', 'worldstereo-memory-dmd')",
+    )
     parser.add_argument("--target_path", default=None, type=str, help="target path")
     parser.add_argument("--align_nframe", default=8, type=int, help="align downsample nframe")
     parser.add_argument("--max_reference", default=8, type=int, help="max reference number")
@@ -38,7 +43,11 @@ if __name__ == '__main__':
     parser.add_argument("--kb_anomaly_percentile", default=90, type=float, help="alignment anoamly percentile")
     parser.add_argument("--pcd_nb_neighbors", default=10, type=int, help="pointcloud filtering number of neighbors")
     parser.add_argument("--pcd_std_ratio", default=2.0, type=float, help="pointcloud filtering std ratio")
-    parser.add_argument("--local_files_only", action="store_true", help="If True, avoid downloading the file and return the path to the local cached file if it exists.")
+    parser.add_argument(
+        "--local_files_only",
+        action="store_true",
+        help="If True, avoid downloading the file and return the path to the local cached file if it exists.",
+    )
     parser.add_argument("--fsdp", action="store_true", help="Enable FSDP model sharding")
     parser.add_argument("--skip_exist", action="store_true", help="skip existing videos")
     parser.add_argument("--seed", default=1024, type=int, help="Random seed")
@@ -72,13 +81,25 @@ if __name__ == '__main__':
     data_world_size = dist.get_world_size() // sp_size
     global_seed = args.seed + data_rank
     set_seed(global_seed)
-    print(f"Global rank:{dist.get_rank()}, Local rank:{local_rank}, SP_rank:{sp_rank}, SP_group:{data_rank}, seed:{global_seed}.")
+    print(
+        f"Global rank:{dist.get_rank()}, Local rank:{local_rank}, SP_rank:{sp_rank}, SP_group:{data_rank}, seed:{global_seed}."
+    )
 
     # == setup models ==
     # Note: FP8 quantization is done INSIDE init_wan_from_cfg, BEFORE FSDP sharding
     moge_model = MoGeModel.from_pretrained(MOGE_ID).to(device)
-    sam3_model = Sam3VideoModel.from_pretrained(SAM3_REPO_ID).to(device, dtype=torch.bfloat16)
-    sam3_processor = Sam3VideoProcessor.from_pretrained(SAM3_REPO_ID)
+    # SAM3 on first use, not at startup. It is reached in exactly one place -- removing the
+    # sky, under `scene_type == "outdoor"` -- and facebook/sam3 is manually gated. For an
+    # indoor scene, loading it here turns a model the run never calls into four ranks
+    # raising GatedRepoError, with traj and render already finished.
+    sam3_model = LazyModel(
+        "SAM3 video model",
+        lambda: Sam3VideoModel.from_pretrained(SAM3_REPO_ID).to(device, dtype=torch.bfloat16),
+    )
+    sam3_processor = LazyModel(
+        "SAM3 video processor",
+        lambda: Sam3VideoProcessor.from_pretrained(SAM3_REPO_ID),
+    )
     rank0_log("Model init over...")
 
     # reset it to the fp32 as we make diffusion scheduler in fp32
@@ -127,53 +148,107 @@ if __name__ == '__main__':
 
             rank0_log(f"Scene {scene.split('/')[-1]}: {len(render_list)} renderings found.")
 
-            if os.path.exists(f"{scene}/render_results/generation_bank_{args.model_type}/aligned_pcd.ply") and args.skip_exist:
+            if (
+                os.path.exists(f"{scene}/render_results/generation_bank_{args.model_type}/aligned_pcd.ply")
+                and args.skip_exist
+            ):
                 rank0_log(f"Scene {scene.split('/')[-1]}: aligned_pcd.ply exists, skip.")
                 continue
 
             width, height = imagesize.get(f"{'/'.join(render_list[0].split('/')[:-2])}/start_frame.png")
             rank0_log("Enable memory control, initializing memory bank.")
             with timer.track("[IO] Memory Bank Initialization"):
-                memory_bank = PanoramaMemoryBank(root_path=scene, image_width=width, image_height=height, device=device, nframe=worldstereo.cfg.nframe,
-                                                 max_reference=args.max_reference, align_nframe=args.align_nframe, rank=sp_rank, world_size=sp_size, moge_model=moge_model,
-                                                 sam3_model=sam3_model, sam3_processor=sam3_processor, results_name=args.model_type, valid_threshold=0.15, pts_num=args.downsampled_pts,
-                                                 kb_anomaly_percentile=args.kb_anomaly_percentile, pcd_nb_neighbors=args.pcd_nb_neighbors, pcd_std_ratio=args.pcd_std_ratio)
+                memory_bank = PanoramaMemoryBank(
+                    root_path=scene,
+                    image_width=width,
+                    image_height=height,
+                    device=device,
+                    nframe=worldstereo.cfg.nframe,
+                    max_reference=args.max_reference,
+                    align_nframe=args.align_nframe,
+                    rank=sp_rank,
+                    world_size=sp_size,
+                    moge_model=moge_model,
+                    sam3_model=sam3_model,
+                    sam3_processor=sam3_processor,
+                    results_name=args.model_type,
+                    valid_threshold=0.15,
+                    pts_num=args.downsampled_pts,
+                    kb_anomaly_percentile=args.kb_anomaly_percentile,
+                    pcd_nb_neighbors=args.pcd_nb_neighbors,
+                    pcd_std_ratio=args.pcd_std_ratio,
+                )
 
             for render_path in render_list:
                 with timer.track("[IO] Loading cameras"):
-                    view_id, traj_id = render_path.split('/')[-3], render_path.split('/')[-2]
+                    view_id, traj_id = render_path.split("/")[-3], render_path.split("/")[-2]
                     rank0_log(f"Scene {scene_name}: view: {view_id}, traj: {traj_id}.")
 
                     target_cameras = json.load(open(f"{scene}/render_results/{view_id}/{traj_id}/camera.json"))
-                    tar_w2cs = torch.from_numpy(np.array(target_cameras["extrinsic"])).to(dtype=torch.float32, device=device)
-                    tar_Ks = torch.from_numpy(np.array(target_cameras["intrinsic"])).to(dtype=torch.float32, device=device)
+                    tar_w2cs = torch.from_numpy(np.array(target_cameras["extrinsic"])).to(
+                        dtype=torch.float32, device=device
+                    )
+                    tar_Ks = torch.from_numpy(np.array(target_cameras["intrinsic"])).to(
+                        dtype=torch.float32, device=device
+                    )
 
-                    if args.skip_exist and os.path.exists(f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4"):
+                    if args.skip_exist and os.path.exists(
+                        f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4"
+                    ):
                         if memory_bank is not None:  # Only update the memory bank
-                            gen_frames = load_video(f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4")
-                            memory_bank.update_memory(gen_frames=gen_frames, tar_w2cs_full=tar_w2cs, tar_Ks_full=tar_Ks, view_id=view_id, traj_id=traj_id)
+                            gen_frames = load_video(
+                                f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4"
+                            )
+                            memory_bank.update_memory(
+                                gen_frames=gen_frames,
+                                tar_w2cs_full=tar_w2cs,
+                                tar_Ks_full=tar_Ks,
+                                view_id=view_id,
+                                traj_id=traj_id,
+                            )
                         continue
 
                 # All ranks run retrieval; sequence-parallel rendering happens inside.
                 with timer.track("Memory Retrieval"):
-                    retrieved_frames, ref_index, ref_index_dict, ref_w2cs, _ = memory_bank.retrieval(tar_w2cs, tar_Ks, view_id=view_id, traj_id=traj_id)
+                    retrieved_frames, ref_index, ref_index_dict, ref_w2cs, _ = memory_bank.retrieval(
+                        tar_w2cs, tar_Ks, view_id=view_id, traj_id=traj_id
+                    )
                     combined_frames = retrieved_frames / 255
                 if rank == 0:  # Rank 0 saves retrieval results
                     with timer.track("[IO] Save Memory retrieval results"):
                         os.makedirs(f"{scene}/render_results/{view_id}/{traj_id}/memory_inputs", exist_ok=True)
-                        export_to_video(combined_frames, f"{scene}/render_results/{view_id}/{traj_id}/memory_inputs/{args.model_type}.mp4", fps=16)
+                        export_to_video(
+                            combined_frames,
+                            f"{scene}/render_results/{view_id}/{traj_id}/memory_inputs/{args.model_type}.mp4",
+                            fps=16,
+                        )
                         if ref_index_dict is not None:
-                            with open(f"{scene}/render_results/{view_id}/{traj_id}/memory_inputs/{args.model_type}_ref_index.json", "w") as w:
+                            with open(
+                                f"{scene}/render_results/{view_id}/{traj_id}/memory_inputs/{args.model_type}_ref_index.json",
+                                "w",
+                            ) as w:
                                 json.dump(ref_index_dict, w, indent=2)
                         if ref_w2cs is not None:
                             ref_w2cs = ref_w2cs.cpu().numpy().tolist()
-                            with open(f"{scene}/render_results/{view_id}/{traj_id}/memory_inputs/{args.model_type}_ref_w2cs.json", "w") as w:
+                            with open(
+                                f"{scene}/render_results/{view_id}/{traj_id}/memory_inputs/{args.model_type}_ref_w2cs.json",
+                                "w",
+                            ) as w:
                                 json.dump(ref_w2cs, w, indent=2)
 
                 dist.barrier()
                 with timer.track("[IO] Loading meta inputs"):
-                    meta_data = load_mutli_traj_dataset(cfg=worldstereo.cfg, input_path=f"{scene}/render_results", output_path=f"{scene}/render_results",
-                                                        view_id=view_id, traj_id=traj_id, device=device, ref_index=ref_index, model_type=args.model_type, task_type="panorama")
+                    meta_data = load_mutli_traj_dataset(
+                        cfg=worldstereo.cfg,
+                        input_path=f"{scene}/render_results",
+                        output_path=f"{scene}/render_results",
+                        view_id=view_id,
+                        traj_id=traj_id,
+                        device=device,
+                        ref_index=ref_index,
+                        model_type=args.model_type,
+                        task_type="panorama",
+                    )
 
                 # ==== Pipline Inputs ====
                 pipeline_kwargs = {k: v for k, v in meta_data.items() if v is not None}
@@ -190,7 +265,10 @@ if __name__ == '__main__':
                     pipeline_kwargs["guidance_scale"] = 5.0
 
                 # pipeline inference
-                with timer.track("Video Model Inference"), torch.autocast("cuda", dtype=autocast_dtype, enabled=autocast_dtype is not None):
+                with (
+                    timer.track("Video Model Inference"),
+                    torch.autocast("cuda", dtype=autocast_dtype, enabled=autocast_dtype is not None),
+                ):
                     output = worldstereo.pipeline(**pipeline_kwargs).frames[0].float()
 
                 gc.collect()
@@ -200,14 +278,24 @@ if __name__ == '__main__':
                     with timer.track("[IO] Save Results"):
                         # [f,c,h,w]->[f,h,w,c]
                         output = output.permute(0, 2, 3, 1).cpu().numpy()
-                        export_to_video(output, f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4", fps=16)
+                        export_to_video(
+                            output, f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4", fps=16
+                        )
                 dist.barrier()
 
                 # update memory bank
                 if memory_bank is not None:
                     with timer.track("[IO] Reload results for memory update* (need to be optimized)"):
-                        gen_frames = load_video(f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4")
-                    memory_bank.update_memory(gen_frames=gen_frames, tar_w2cs_full=tar_w2cs, tar_Ks_full=tar_Ks, view_id=view_id, traj_id=traj_id)
+                        gen_frames = load_video(
+                            f"{scene}/render_results/{view_id}/{traj_id}/{args.model_type}_result.mp4"
+                        )
+                    memory_bank.update_memory(
+                        gen_frames=gen_frames,
+                        tar_w2cs_full=tar_w2cs,
+                        tar_Ks_full=tar_Ks,
+                        view_id=view_id,
+                        traj_id=traj_id,
+                    )
                 dist.barrier()
 
             if memory_bank is not None:
@@ -221,7 +309,10 @@ if __name__ == '__main__':
 
                 # memory bank over, export pcd
                 with timer.track("[IO] Save final aligned pointcloud (update memory)"):
-                    memory_bank.export_pcd(f"{memory_bank.root_path}/render_results/generation_bank_{args.model_type}", N_points=args.downsampled_pts)
+                    memory_bank.export_pcd(
+                        f"{memory_bank.root_path}/render_results/generation_bank_{args.model_type}",
+                        N_points=args.downsampled_pts,
+                    )
                 dist.barrier()
 
             if rank == 0:

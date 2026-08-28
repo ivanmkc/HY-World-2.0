@@ -31,9 +31,44 @@ from .general_utils import (
     rank0_log,
     color_print,
     sample_align_nframe,
-    colorize_depth
+    colorize_depth,
 )
 from .pointcloud import depth2pcd
+
+
+class LazyModel:
+    """Defers a `from_pretrained` until the model is first actually touched.
+
+    SAM3 is loaded here and in video_gen.py whatever the scene is, and used in exactly one
+    place -- removing the sky, under `scene_type == "outdoor"`. An indoor scene therefore
+    pays for it and never calls it.
+
+    That matters because `facebook/sam3` is a manually gated repository. Without an approved
+    token the load does not degrade, it fails the run: four ranks raising GatedRepoError out
+    of stage video, after traj and render had both succeeded, for a model the indoor path
+    would never have asked a question of.
+
+    Attribute access and calls forward to the real object, so a path that does reach SAM3
+    behaves exactly as before -- it just builds at the point of use instead of at startup.
+    """
+
+    def __init__(self, label, build):
+        self._label = label
+        self._build = build
+        self._obj = None
+
+    def _resolve(self):
+        if self._obj is None:
+            print(f"Models: building {self._label} on first use...")
+            self._obj = self._build()
+        return self._obj
+
+    def __getattr__(self, name):
+        # Only reached for names not found normally, so _label/_build/_obj never recurse.
+        return getattr(self._resolve(), name)
+
+    def __call__(self, *args, **kwargs):
+        return self._resolve()(*args, **kwargs)
 
 
 def statistical_outlier_removal(points, colors, nb_neighbors=20, std_ratio=2.0):
@@ -97,7 +132,7 @@ def compute_depth_percentile_map(depth, depth_mask):
 
     # Use searchsorted to find each depth's rank.
     # 'right' finds the first position greater than the value.
-    ranks = np.searchsorted(sorted_depths, depth[depth_mask], side='right')
+    ranks = np.searchsorted(sorted_depths, depth[depth_mask], side="right")
 
     # Compute percentile: rank / n * 100.
     percentiles = (ranks / n_valid) * 100.0
@@ -136,7 +171,7 @@ def calculate_camera_distance(cam1_extrinsic, cam2_extrinsic):
     R2 = cam2_extrinsic[:, :3, :3]  # [B, 3, 3]
 
     # Calculate rotation distance using Frobenius norm
-    rotation_dist = torch.norm(R1 - R2, p='fro', dim=(1, 2))  # [B]
+    rotation_dist = torch.norm(R1 - R2, p="fro", dim=(1, 2))  # [B]
 
     # Combine translation and rotation distances
     total_dist = translation_dist + 0.1 * rotation_dist  # [B]
@@ -187,12 +222,26 @@ def get_camera_frustum_corners(K, extrinsic, image_width, image_height, depth_ra
 
     # Define image corners in pixel coordinates for all batches
     # corners_2d: [B, 4, 3]
-    corners_2d = torch.stack([
-        torch.stack([torch.zeros(batch_size, device=device), torch.zeros(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1),
-        torch.stack([image_width, torch.zeros(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1),
-        torch.stack([image_width, image_height, torch.ones(batch_size, device=device)], dim=1),
-        torch.stack([torch.zeros(batch_size, device=device), image_height, torch.ones(batch_size, device=device)], dim=1)
-    ], dim=1)  # [B, 4, 3]
+    corners_2d = torch.stack(
+        [
+            torch.stack(
+                [
+                    torch.zeros(batch_size, device=device),
+                    torch.zeros(batch_size, device=device),
+                    torch.ones(batch_size, device=device),
+                ],
+                dim=1,
+            ),
+            torch.stack(
+                [image_width, torch.zeros(batch_size, device=device), torch.ones(batch_size, device=device)], dim=1
+            ),
+            torch.stack([image_width, image_height, torch.ones(batch_size, device=device)], dim=1),
+            torch.stack(
+                [torch.zeros(batch_size, device=device), image_height, torch.ones(batch_size, device=device)], dim=1
+            ),
+        ],
+        dim=1,
+    )  # [B, 4, 3]
 
     # Unproject to normalized camera coordinates
     # K_inv: [B, 3, 3], corners_2d: [B, 4, 3]
@@ -268,7 +317,9 @@ def calculate_frustum_volume_overlap(corners1, corners2):
     return overlap_score
 
 
-def calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intrinsic, cam2_extrinsic, image_width, image_height, near, far):
+def calculate_fov_overlap(
+    cam1_intrinsic, cam1_extrinsic, cam2_intrinsic, cam2_extrinsic, image_width, image_height, near, far
+):
     """Calculate FOV overlap between two cameras using frustum intersection
 
     This function constructs frustums from near and far planes and calculates their overlap.
@@ -329,9 +380,20 @@ def calculate_fov_overlap(cam1_intrinsic, cam1_extrinsic, cam2_intrinsic, cam2_e
     return overlap_ratio, angle_between
 
 
-def find_closest_camera_in_view(target_extrinsic, ref_extrinsics, target_intrinsic, ref_intrinsics,
-                                image_width, image_height, method="distance", near=0.1, far=5.0, angle_penalty=False,
-                                shortcut_index=None, topk_return=0):
+def find_closest_camera_in_view(
+    target_extrinsic,
+    ref_extrinsics,
+    target_intrinsic,
+    ref_intrinsics,
+    image_width,
+    image_height,
+    method="distance",
+    near=0.1,
+    far=5.0,
+    angle_penalty=False,
+    shortcut_index=None,
+    topk_return=0,
+):
     """Find the camera in reference views that is closest to the target camera
 
     Args:
@@ -350,7 +412,7 @@ def find_closest_camera_in_view(target_extrinsic, ref_extrinsics, target_intrins
     num_refs = ref_extrinsics.shape[0]
 
     if num_refs == 0:
-        return None, float('inf') if method == "distance" else -1.0
+        return None, float("inf") if method == "distance" else -1.0
 
     # Expand target to match batch size
     target_extrinsic_batch = target_extrinsic.unsqueeze(0).expand(num_refs, -1, -1)  # [N, 4, 4]
@@ -371,10 +433,14 @@ def find_closest_camera_in_view(target_extrinsic, ref_extrinsics, target_intrins
 
         # Batch calculate FOV overlap
         overlap_ratios, angle_betweens = calculate_fov_overlap(
-            target_intrinsic_batch, target_extrinsic_batch,
-            ref_intrinsics, ref_extrinsics,
-            image_width, image_height,
-            near=near, far=far
+            target_intrinsic_batch,
+            target_extrinsic_batch,
+            ref_intrinsics,
+            ref_extrinsics,
+            image_width,
+            image_height,
+            near=near,
+            far=far,
         )  # overlap_ratios: [N], angle_betweens: [N]
 
         angle_betweens[angle_betweens < 0] = -angle_betweens[angle_betweens < 0]
@@ -405,11 +471,7 @@ def find_closest_camera_in_view(target_extrinsic, ref_extrinsics, target_intrins
 class CameraSelector:
     """Representative camera selector that fuses camera extrinsics and image features."""
 
-    def __init__(
-            self,
-            feature_extractor='dinov2',
-            device: str = 'cuda'
-    ):
+    def __init__(self, feature_extractor="dinov2", device: str = "cuda"):
         self.device = device
         self.feature_extractor = feature_extractor
         self.model = None
@@ -419,9 +481,10 @@ class CameraSelector:
 
     def _load_model(self, extractor: str):
         """Load the pretrained model."""
-        if extractor == 'dinov2':
+        if extractor == "dinov2":
             from transformers import AutoImageProcessor, AutoModel
-            model_path = 'facebook/dinov2-base'
+
+            model_path = "facebook/dinov2-base"
             self.processor = AutoImageProcessor.from_pretrained(model_path, use_fast=True)
             self.model = AutoModel.from_pretrained(model_path).to(self.device)
         else:
@@ -445,7 +508,7 @@ class CameraSelector:
             img_pil = Image.fromarray(img)
 
             # Extract
-            if self.feature_extractor == 'dinov2':
+            if self.feature_extractor == "dinov2":
                 with torch.no_grad():
                     inputs = self.processor(images=img_pil, return_tensors="pt")
                     inputs.pixel_values = inputs.pixel_values.to(self.device)
@@ -484,13 +547,13 @@ class CameraSelector:
         return np.array(scores)
 
     def select(
-            self,
-            extrinsics: np.ndarray,
-            images: List[np.ndarray],
-            topk: int,
-            camera_weight: float = 0.3,
-            image_weight: float = 0.7,
-            quality_bias: float = 0.1,  # Quality preference weight.
+        self,
+        extrinsics: np.ndarray,
+        images: List[np.ndarray],
+        topk: int,
+        camera_weight: float = 0.3,
+        image_weight: float = 0.7,
+        quality_bias: float = 0.1,  # Quality preference weight.
     ) -> Tuple[np.ndarray, dict]:
         """
         Select representative cameras by combining camera extrinsics and image features.
@@ -526,18 +589,15 @@ class CameraSelector:
         image_features = self._normalize(image_features)
 
         # 5. Fuse features.
-        combined_features = np.concatenate([
-            camera_features * camera_weight,
-            image_features * image_weight
-        ], axis=1)
+        combined_features = np.concatenate([camera_features * camera_weight, image_features * image_weight], axis=1)
 
         # 6. FPS with quality bias.
         indices = self._quality_aware_fps(combined_features, quality_scores, topk, quality_bias)
 
         info = {
-            'positions': positions,
-            'quality_scores': quality_scores,
-            'selected_quality_scores': quality_scores[indices],
+            "positions": positions,
+            "quality_scores": quality_scores,
+            "selected_quality_scores": quality_scores[indices],
         }
 
         return indices, info
@@ -574,11 +634,7 @@ class CameraSelector:
         return (features - mean) / std
 
     def _quality_aware_fps(
-            self,
-            features: np.ndarray,
-            quality_scores: np.ndarray,
-            k: int,
-            quality_bias: float
+        self, features: np.ndarray, quality_scores: np.ndarray, k: int, quality_bias: float
     ) -> np.ndarray:
         """
         Quality-aware farthest point sampling.
@@ -695,25 +751,38 @@ def adaptive_voxel_downsample(points, colors=None, N_points=1_000_000, tol=0.2, 
     else:
         ds_points = result
         ds_colors = None
-    rank0_log(f"Voxel downsample: {n_total} -> {ds_points.shape[0]} points (target: {N_points}, voxel_size: {best_voxel_size:.6f})")
+    rank0_log(
+        f"Voxel downsample: {n_total} -> {ds_points.shape[0]} points (target: {N_points}, voxel_size: {best_voxel_size:.6f})"
+    )
 
     return ds_points, ds_colors, best_voxel_size
 
 
 class PanoramaMemoryBank:
-    def __init__(self, root_path, image_width, image_height, device,
-                 nframe=21, max_reference=8, align_nframe=8,
-                 rank=0, world_size=1,
-                 moge_model=None, sam3_model=None, sam3_processor=None,
-                 camera_selector="dinov2",
-                 results_name=None,
-                 valid_threshold=0.3,
-                 apply_normal=True,
-                 pts_num=2_000_000,
-                 percentile_threshold=20,
-                 kb_anomaly_percentile=90,
-                 pcd_nb_neighbors=10,
-                 pcd_std_ratio=2.0):
+    def __init__(
+        self,
+        root_path,
+        image_width,
+        image_height,
+        device,
+        nframe=21,
+        max_reference=8,
+        align_nframe=8,
+        rank=0,
+        world_size=1,
+        moge_model=None,
+        sam3_model=None,
+        sam3_processor=None,
+        camera_selector="dinov2",
+        results_name=None,
+        valid_threshold=0.3,
+        apply_normal=True,
+        pts_num=2_000_000,
+        percentile_threshold=20,
+        kb_anomaly_percentile=90,
+        pcd_nb_neighbors=10,
+        pcd_std_ratio=2.0,
+    ):
         # loading panorama info
         self.root_path = root_path
         self.image_width = image_width
@@ -725,18 +794,22 @@ class PanoramaMemoryBank:
 
         # Voxel-downsample global_pcd to determine the initial voxel_size.
         global_pcd_points_sampled, global_pcd_colors_sampled, voxel_size = adaptive_voxel_downsample(
-            self.global_pcd.vertices.astype(np.float64),
-            colors=self.global_pcd.colors[:, :3],
-            N_points=pts_num
+            self.global_pcd.vertices.astype(np.float64), colors=self.global_pcd.colors[:, :3], N_points=pts_num
         )
-        self.global_pcd_sampled = trimesh.PointCloud(vertices=global_pcd_points_sampled, colors=global_pcd_colors_sampled)
+        self.global_pcd_sampled = trimesh.PointCloud(
+            vertices=global_pcd_points_sampled, colors=global_pcd_colors_sampled
+        )
         self.voxel_size = voxel_size
         self.sky_pcd_sampled = None
         if os.path.exists(f"{root_path}/render_results/sky_pcd.ply"):
             sky_pcd = trimesh.load(f"{root_path}/render_results/sky_pcd.ply")
             if hasattr(sky_pcd, "vertices") and sky_pcd.vertices.shape[0] > 0:
-                sky_pcd_points_sampled, sky_pcd_colors_sampled = voxel_downsample_fixed(points=sky_pcd.vertices, colors=sky_pcd.colors[:, :3], voxel_size=voxel_size)
-                self.sky_pcd_sampled = trimesh.PointCloud(vertices=sky_pcd_points_sampled, colors=sky_pcd_colors_sampled)
+                sky_pcd_points_sampled, sky_pcd_colors_sampled = voxel_downsample_fixed(
+                    points=sky_pcd.vertices, colors=sky_pcd.colors[:, :3], voxel_size=voxel_size
+                )
+                self.sky_pcd_sampled = trimesh.PointCloud(
+                    vertices=sky_pcd_points_sampled, colors=sky_pcd_colors_sampled
+                )
 
         self.global_normal = None
         if apply_normal:
@@ -746,7 +819,9 @@ class PanoramaMemoryBank:
             else:
                 rank0_log(f"No global normal found in {root_path}/render_results/global_normal.npy!", "WARNING")
         ground_mask = (np.array(Image.open(f"{root_path}/render_results/sky_mask.png")) / 255).astype(np.bool_)
-        full_depth = torch.load(f"{root_path}/render_results/full_depth_prediction.pt", weights_only=False, map_location="cpu")
+        full_depth = torch.load(
+            f"{root_path}/render_results/full_depth_prediction.pt", weights_only=False, map_location="cpu"
+        )
         self.min_d_ = full_depth["distance"][ground_mask].min().item()
         self.max_d_ = full_depth["distance"][ground_mask].max().item()
         self.max_d = self.max_d_ * 1.1
@@ -768,8 +843,8 @@ class PanoramaMemoryBank:
         # predefine 2d points
         x = torch.arange(image_width).float()
         y = torch.arange(image_height).float()
-        points = torch.stack(torch.meshgrid(x, y, indexing='ij'), -1)
-        points = einops.rearrange(points, 'w h c -> (h w) c')
+        points = torch.stack(torch.meshgrid(x, y, indexing="ij"), -1)
+        points = einops.rearrange(points, "w h c -> (h w) c")
         self.points = point_padding(points).to(device)
 
         # build panoramic memory bank
@@ -786,20 +861,24 @@ class PanoramaMemoryBank:
 
         def _load_item(args):
             img_p, dep_p, cam_dict = args
-            key = img_p.split('/')[-1].split('.')[0]
-            view_id, traj_id = img_p.split('/')[-4], img_p.split('/')[-3]
+            key = img_p.split("/")[-1].split(".")[0]
+            view_id, traj_id = img_p.split("/")[-4], img_p.split("/")[-3]
             fname = f"{view_id}/{traj_id}/{key}"
             return (
-                np.array(cam_dict[key]['extrinsic']),
-                np.array(cam_dict[key]['intrinsic']),
-                Image.open(img_p).convert('RGB'),
+                np.array(cam_dict[key]["extrinsic"]),
+                np.array(cam_dict[key]["intrinsic"]),
+                Image.open(img_p).convert("RGB"),
                 load_16bit_png_depth(dep_p),
-                fname
+                fname,
             )
 
         with ThreadPoolExecutor(max_workers=8) as executor:
             # map keeps result order consistent with task order.
-            results = list(tqdm(executor.map(_load_item, tasks), total=len(tasks), desc="Loading memory bank...", disable=rank != 0))
+            results = list(
+                tqdm(
+                    executor.map(_load_item, tasks), total=len(tasks), desc="Loading memory bank...", disable=rank != 0
+                )
+            )
 
         if results:
             self.ref_w2cs, self.ref_Ks, self.ref_frames, self.ref_depths, self.fnames = map(list, zip(*results))
@@ -822,8 +901,16 @@ class PanoramaMemoryBank:
         rank0_log(f"Initializing SAM3 Model...")
         if sam3_model is None or sam3_processor is None:
             from transformers import Sam3VideoModel, Sam3VideoProcessor
-            self.sam3_model = Sam3VideoModel.from_pretrained("facebook/sam3").to(device, dtype=torch.bfloat16)
-            self.sam3_processor = Sam3VideoProcessor.from_pretrained("facebook/sam3")
+
+            # Lazy for the same reason as the caller's: gated, and only reached outdoors.
+            self.sam3_model = LazyModel(
+                "SAM3 video model",
+                lambda: Sam3VideoModel.from_pretrained("facebook/sam3").to(device, dtype=torch.bfloat16),
+            )
+            self.sam3_processor = LazyModel(
+                "SAM3 video processor",
+                lambda: Sam3VideoProcessor.from_pretrained("facebook/sam3"),
+            )
         else:
             self.sam3_model = sam3_model
             self.sam3_processor = sam3_processor
@@ -866,7 +953,11 @@ class PanoramaMemoryBank:
 
             # Process global_pcd: for indoor scenes, keep only point clouds near the poles.
             global_pcd_vertices = self.global_pcd_sampled.vertices  # [N, 3]
-            global_pcd_colors = self.global_pcd_sampled.colors[:, :3] if self.global_pcd_sampled.colors.shape[1] >= 3 else self.global_pcd_sampled.colors
+            global_pcd_colors = (
+                self.global_pcd_sampled.colors[:, :3]
+                if self.global_pcd_sampled.colors.shape[1] >= 3
+                else self.global_pcd_sampled.colors
+            )
 
             if self.meta_info["scene_type"] == "indoor":
                 # Compute each point's distance to the origin in the xy plane.
@@ -882,10 +973,12 @@ class PanoramaMemoryBank:
                 n_sample = min(n_global, max(int(n_global * 0.1), 10000))  # Keep at most 20% of global points.
                 sampled_indices = np.random.choice(n_global, size=n_sample, replace=False, p=sample_prob)
                 global_pcd_export = trimesh.PointCloud(
-                    vertices=global_pcd_vertices[sampled_indices],
-                    colors=global_pcd_colors[sampled_indices]
+                    vertices=global_pcd_vertices[sampled_indices], colors=global_pcd_colors[sampled_indices]
                 )
-                color_print(f"[Indoor] Global PCD: {n_global} -> {n_sample} points (polar补充, sigma={sigma:.4f}, depth_median={self.depth_median:.4f})", "info")
+                color_print(
+                    f"[Indoor] Global PCD: {n_global} -> {n_sample} points (polar补充, sigma={sigma:.4f}, depth_median={self.depth_median:.4f})",
+                    "info",
+                )
             else:
                 global_pcd_export = self.global_pcd_sampled
 
@@ -898,8 +991,15 @@ class PanoramaMemoryBank:
             pcd_info = {
                 "scene_type": self.meta_info["scene_type"],
                 "global_pcd": {"num": global_pcd_export.vertices.shape[0], "voxel_size": self.voxel_size},
-                "aligned_pcd": {"num_voxel": origin_aligned_num, "num_final": aligned_pcd.vertices.shape[0], "voxel_size": self.voxel_size},
-                "sky_pcd": {"num": 0 if self.sky_pcd_sampled is None else self.sky_pcd_sampled.vertices.shape[0], "voxel_size": self.voxel_size}
+                "aligned_pcd": {
+                    "num_voxel": origin_aligned_num,
+                    "num_final": aligned_pcd.vertices.shape[0],
+                    "voxel_size": self.voxel_size,
+                },
+                "sky_pcd": {
+                    "num": 0 if self.sky_pcd_sampled is None else self.sky_pcd_sampled.vertices.shape[0],
+                    "voxel_size": self.voxel_size,
+                },
             }
 
             with open(f"{save_path}/pcd_info.json", "w") as f:
@@ -923,7 +1023,7 @@ class PanoramaMemoryBank:
             if traj_id == "traj0":
                 shortcut_indices = shortcut_indices[3::2]
             else:
-                shortcut_indices = shortcut_indices[:len(shortcut_indices) // 2][3::2]
+                shortcut_indices = shortcut_indices[: len(shortcut_indices) // 2][3::2]
         else:
             shortcut_type = "none"
             shortcut_indices = []
@@ -971,8 +1071,13 @@ class PanoramaMemoryBank:
 
             # Track ref_index when best_idx changes from previous frame
             if best_idx not in retrieval_map:
-                retrieval_map[best_idx] = i - 1  # key: best_idx, value: the frame index in retrieved_frames corresponding to best_idx, recording only the earliest occurrence.
-            ref_index_dict[retrieval_map[best_idx]][i] = {"score": best_score, "angle_diff": angle_diff}  # key: frame index in retrieved_frames, value: target position corresponding to that retrieval frame.
+                retrieval_map[best_idx] = (
+                    i - 1
+                )  # key: best_idx, value: the frame index in retrieved_frames corresponding to best_idx, recording only the earliest occurrence.
+            ref_index_dict[retrieval_map[best_idx]][i] = {
+                "score": best_score,
+                "angle_diff": angle_diff,
+            }  # key: frame index in retrieved_frames, value: target position corresponding to that retrieval frame.
 
             retrieved_frames.append(np.array(self.ref_frames[best_idx])[None])
             retrieved_w2cs.append(self.ref_w2cs[best_idx])
@@ -983,8 +1088,14 @@ class PanoramaMemoryBank:
             rank0_log(f"Too many references. {len(ref_index_dict)} > {self.max_reference}")
             retrieved_w2cs = torch.stack(retrieved_w2cs)
             retrieved_Ks = torch.stack(retrieved_Ks)
-            indices, _ = self.camera_selector.select(retrieved_w2cs.cpu().numpy(), retrieved_frames, topk=self.max_reference,
-                                                     camera_weight=0.3, image_weight=0.7, quality_bias=0.1)
+            indices, _ = self.camera_selector.select(
+                retrieved_w2cs.cpu().numpy(),
+                retrieved_frames,
+                topk=self.max_reference,
+                camera_weight=0.3,
+                image_weight=0.7,
+                quality_bias=0.1,
+            )
             retrieved_w2cs = retrieved_w2cs[indices]
             retrieved_Ks = retrieved_Ks[indices]
             retrieved_frames_selected = [retrieved_frames[i] for i in indices]
@@ -1007,13 +1118,18 @@ class PanoramaMemoryBank:
                     method="fov_overlap",
                     near=0.1,
                     far=max(self.depth_median * 8, 0.15),
-                    angle_penalty=True
+                    angle_penalty=True,
                 )
 
                 # Track ref_index when best_idx changes from previous frame
                 if best_idx not in retrieval_map:
-                    retrieval_map[best_idx] = i - 1  # key: best_idx, value: the frame index in retrieved_frames corresponding to best_idx, recording only the earliest occurrence.
-                ref_index_dict[retrieval_map[best_idx]][i] = {"score": best_score, "angle_diff": angle_diff}  # key: frame index in retrieved_frames, value: target position corresponding to that retrieval frame.
+                    retrieval_map[best_idx] = (
+                        i - 1
+                    )  # key: best_idx, value: the frame index in retrieved_frames corresponding to best_idx, recording only the earliest occurrence.
+                ref_index_dict[retrieval_map[best_idx]][i] = {
+                    "score": best_score,
+                    "angle_diff": angle_diff,
+                }  # key: frame index in retrieved_frames, value: target position corresponding to that retrieval frame.
 
                 retrieved_frames.append(np.array(retrieved_frames_selected[best_idx]))
                 ref_w2cs.append(retrieved_w2cs[best_idx])  # Reorder retrieved_w2cs.
@@ -1061,7 +1177,7 @@ class PanoramaMemoryBank:
             os.makedirs(f"{self.world_mirror_dir}/images", exist_ok=True)
 
             # Multiprocess assignment: each rank processes its own frames.
-            process_list = np.arange(len(self.fnames))[self.rank::self.world_size]
+            process_list = np.arange(len(self.fnames))[self.rank :: self.world_size]
 
             # Camera dictionary for this rank.
             local_camera_dict = {"extrinsics": [], "intrinsics": []}
@@ -1075,14 +1191,12 @@ class PanoramaMemoryBank:
                 else:
                     camera_id = f"{view_id}-{traj_id}-{frame_id}"
 
-                local_camera_dict["extrinsics"].append({
-                    "camera_id": camera_id,
-                    "matrix": self.ref_w2cs[gi].inverse().cpu().numpy().tolist()
-                })
-                local_camera_dict["intrinsics"].append({
-                    "camera_id": camera_id,
-                    "matrix": self.ref_Ks[gi].cpu().numpy().tolist()
-                })
+                local_camera_dict["extrinsics"].append(
+                    {"camera_id": camera_id, "matrix": self.ref_w2cs[gi].inverse().cpu().numpy().tolist()}
+                )
+                local_camera_dict["intrinsics"].append(
+                    {"camera_id": camera_id, "matrix": self.ref_Ks[gi].cpu().numpy().tolist()}
+                )
                 save_tasks.append((self.ref_frames[gi], f"{self.world_mirror_dir}/images/{camera_id}.png"))
 
             # Use multithreading to speed up image saving.
@@ -1132,11 +1246,18 @@ class PanoramaMemoryBank:
         if self.rank == 0:
             if not (skip_exist and os.path.exists(f"{self.world_mirror_dir}/name_map.json")):
                 wm_cmd = [
-                    "torchrun", f"--nproc_per_node={self.world_size}", "-m", "worldrecon.pipeline",
-                    "--input_path", f"{self.world_mirror_dir}/images",
-                    "--prior_cam_path", f"{self.world_mirror_dir}/cameras.json",
-                    "--strict_output_path", f"{self.world_mirror_dir}/results",
-                    "--target_size", "832",
+                    "torchrun",
+                    f"--nproc_per_node={self.world_size}",
+                    "-m",
+                    "worldrecon.pipeline",
+                    "--input_path",
+                    f"{self.world_mirror_dir}/images",
+                    "--prior_cam_path",
+                    f"{self.world_mirror_dir}/cameras.json",
+                    "--strict_output_path",
+                    f"{self.world_mirror_dir}/results",
+                    "--target_size",
+                    "832",
                     "--log_time",
                     "--no_interactive",
                     "--no_save_gs",
@@ -1146,7 +1267,10 @@ class PanoramaMemoryBank:
                     "--no_edge_mask",
                     "--use_fsdp",
                     "--enable_bf16",
-                    "--disable_heads", "normal", "points", "gs"
+                    "--disable_heads",
+                    "normal",
+                    "points",
+                    "gs",
                 ]
                 color_print(f"[Rank0] Running World Mirror inference: {' '.join(wm_cmd)}", "info")
                 result = subprocess.run(wm_cmd, cwd="..")
@@ -1203,8 +1327,11 @@ class PanoramaMemoryBank:
         anchor_inv_depths = 1.0 / anchor_depths  # Convert to inv_depth space, consistent with RANSAC fitting.
 
         if self.rank == 0:
-            color_print(f"[Anchor Depths] min_d_={self.min_d_:.4f}, depth_median={self.depth_median:.4f}, "
-                        f"max_d_={self.max_d_:.4f}, anchor_far={anchor_far:.4f}", "info")
+            color_print(
+                f"[Anchor Depths] min_d_={self.min_d_:.4f}, depth_median={self.depth_median:.4f}, "
+                f"max_d_={self.max_d_:.4f}, anchor_far={anchor_far:.4f}",
+                "info",
+            )
             color_print(f"[Anchor Depths] depths = {anchor_depths.tolist()}", "info")
             color_print(f"[Anchor InvDepths] inv_depths = {anchor_inv_depths.tolist()}", "info")
 
@@ -1250,19 +1377,28 @@ class PanoramaMemoryBank:
                 color_print(f"{'=' * 80}", "info")
 
                 # Global k,b statistics.
-                color_print(f"[Global k] min={all_valid_ks.min():.6f}, max={all_valid_ks.max():.6f}, "
-                            f"median={np.median(all_valid_ks):.6f}, mean={all_valid_ks.mean():.6f}, "
-                            f"std={all_valid_ks.std():.6f}", "info")
-                color_print(f"[Global b] min={all_valid_bs.min():.6f}, max={all_valid_bs.max():.6f}, "
-                            f"median={np.median(all_valid_bs):.6f}, mean={all_valid_bs.mean():.6f}, "
-                            f"std={all_valid_bs.std():.6f}", "info")
+                color_print(
+                    f"[Global k] min={all_valid_ks.min():.6f}, max={all_valid_ks.max():.6f}, "
+                    f"median={np.median(all_valid_ks):.6f}, mean={all_valid_ks.mean():.6f}, "
+                    f"std={all_valid_ks.std():.6f}",
+                    "info",
+                )
+                color_print(
+                    f"[Global b] min={all_valid_bs.min():.6f}, max={all_valid_bs.max():.6f}, "
+                    f"median={np.median(all_valid_bs):.6f}, mean={all_valid_bs.mean():.6f}, "
+                    f"std={all_valid_bs.std():.6f}",
+                    "info",
+                )
 
                 # Median effect at each anchor, i.e. the "standard" mapping result.
                 color_print(f"\n[Median Effect at Anchors] (aligned_inv_depth = k * anchor_inv_depth + b)", "info")
                 for ai, (ad, aid, me) in enumerate(zip(anchor_depths, anchor_inv_depths, median_effect)):
                     # The aligned_depth corresponding to the median effect is 1 / median_effect.
-                    aligned_d = 1.0 / me if abs(me) > 1e-8 else float('inf')
-                    color_print(f"  Anchor[{ai}]: depth={ad:.4f} -> inv_depth={aid:.4f} -> median_aligned_inv_depth={me:.6f} (aligned_depth={aligned_d:.4f})", "info")
+                    aligned_d = 1.0 / me if abs(me) > 1e-8 else float("inf")
+                    color_print(
+                        f"  Anchor[{ai}]: depth={ad:.4f} -> inv_depth={aid:.4f} -> median_aligned_inv_depth={me:.6f} (aligned_depth={aligned_d:.4f})",
+                        "info",
+                    )
 
                 # Deviation distribution statistics.
                 color_print(f"\n[Max Absolute Deviation Distribution]", "info")
@@ -1285,24 +1421,33 @@ class PanoramaMemoryBank:
                     vid_max_rel_dev = max_relative_deviation[vid_mask]
                     vid_ks = all_valid_ks[vid_mask]
                     vid_bs = all_valid_bs[vid_mask]
-                    color_print(f"  {vname} ({vid_mask.sum()} frames): "
-                                f"k=[{vid_ks.min():.4f},{vid_ks.max():.4f}], "
-                                f"b=[{vid_bs.min():.4f},{vid_bs.max():.4f}], "
-                                f"max_abs_dev=[{vid_max_dev.min():.6f},{vid_max_dev.max():.6f}], "
-                                f"max_rel_dev=[{vid_max_rel_dev.min():.4%},{vid_max_rel_dev.max():.4%}]", "info")
+                    color_print(
+                        f"  {vname} ({vid_mask.sum()} frames): "
+                        f"k=[{vid_ks.min():.4f},{vid_ks.max():.4f}], "
+                        f"b=[{vid_bs.min():.4f},{vid_bs.max():.4f}], "
+                        f"max_abs_dev=[{vid_max_dev.min():.6f},{vid_max_dev.max():.6f}], "
+                        f"max_rel_dev=[{vid_max_rel_dev.min():.4%},{vid_max_rel_dev.max():.4%}]",
+                        "info",
+                    )
 
                 # Output the top 10 frames with the largest deviations.
                 color_print(f"\n[Top-10 Outlier Candidates] (按 max_absolute_deviation 排序)", "info")
                 top_indices = np.argsort(max_deviation)[::-1][:10]
                 for rank_i, idx in enumerate(top_indices):
-                    color_print(f"  #{rank_i + 1}: video={all_valid_video_names[idx]}, frame_id={all_valid_frame_ids[idx]}, "
-                                f"k={all_valid_ks[idx]:.6f}, b={all_valid_bs[idx]:.6f}, "
-                                f"max_abs_dev={max_deviation[idx]:.6f}, max_rel_dev={max_relative_deviation[idx]:.4%}", "info")
+                    color_print(
+                        f"  #{rank_i + 1}: video={all_valid_video_names[idx]}, frame_id={all_valid_frame_ids[idx]}, "
+                        f"k={all_valid_ks[idx]:.6f}, b={all_valid_bs[idx]:.6f}, "
+                        f"max_abs_dev={max_deviation[idx]:.6f}, max_rel_dev={max_relative_deviation[idx]:.4%}",
+                        "info",
+                    )
 
             # Compute the inlier threshold based on kb_anomaly_percentile using relative deviation.
             inlier_threshold = float(np.percentile(max_relative_deviation, self.kb_anomaly_percentile))
             if self.rank == 0:
-                color_print(f"[KB Anomaly] Using P{self.kb_anomaly_percentile} as inlier threshold (relative): {inlier_threshold:.4%}", "info")
+                color_print(
+                    f"[KB Anomaly] Using P{self.kb_anomaly_percentile} as inlier threshold (relative): {inlier_threshold:.4%}",
+                    "info",
+                )
                 n_inliers = int((max_relative_deviation <= inlier_threshold).sum())
                 n_outliers = N_valid - n_inliers
                 color_print(f"[KB Anomaly] Inliers: {n_inliers}, Outliers: {n_outliers}", "info")
@@ -1315,7 +1460,7 @@ class PanoramaMemoryBank:
             return inlier_threshold, frame_deviations
 
         # If there are no valid frames, return an infinite threshold and an empty dictionary.
-        return float('inf'), {}
+        return float("inf"), {}
 
     def alignment(self, debug_mode=False):
         # =====================================================================
@@ -1350,7 +1495,7 @@ class PanoramaMemoryBank:
             else:
                 global_video_indices_map[f"{view_id}/{traj_id}"].append(i)
 
-        video_names_rank = video_names[self.rank::self.world_size]
+        video_names_rank = video_names[self.rank :: self.world_size]
 
         # =====================================================================
         # Phase 2: Preprocessing -- precompute MoGe depth and SAM3 sky masks by video.
@@ -1378,14 +1523,21 @@ class PanoramaMemoryBank:
             mono_depths = []
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
                 for i in range(N_align):
-                    moge_pred = self.moge_model.infer(gen_tensor[i:i + 1])
+                    moge_pred = self.moge_model.infer(gen_tensor[i : i + 1])
                     fname = self.fnames[global_indices[i]]
                     if os.path.exists(f"{self.world_mirror_dir}/results/depth/depth_{self.name_map[fname]}.npy"):
                         depth_wm = np.load(f"{self.world_mirror_dir}/results/depth/depth_{self.name_map[fname]}.npy")
-                        depth_wm = cv2.resize(depth_wm, (moge_pred['depth'].shape[2], moge_pred['depth'].shape[1]), interpolation=cv2.INTER_NEAREST)
-                        moge_pred['depth'] = torch.from_numpy(depth_wm).unsqueeze(0).to(self.device)
+                        depth_wm = cv2.resize(
+                            depth_wm,
+                            (moge_pred["depth"].shape[2], moge_pred["depth"].shape[1]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        moge_pred["depth"] = torch.from_numpy(depth_wm).unsqueeze(0).to(self.device)
                     else:
-                        color_print(f"{self.world_mirror_dir}/results/depth/depth_{self.name_map[fname]} depth not exist.", "warning")
+                        color_print(
+                            f"{self.world_mirror_dir}/results/depth/depth_{self.name_map[fname]} depth not exist.",
+                            "warning",
+                        )
                     mono_depths.append(moge_pred)
 
             # Use SAM3 to remove the sky mask.
@@ -1406,14 +1558,18 @@ class PanoramaMemoryBank:
                     text="sky",
                 )
                 outputs_per_frame = {}
-                for model_outputs in self.sam3_model.propagate_in_video_iterator(inference_session=inference_session,
-                                                                                 max_frame_num_to_track=video_frames.shape[0],
-                                                                                 show_progress_bar=False):
+                for model_outputs in self.sam3_model.propagate_in_video_iterator(
+                    inference_session=inference_session,
+                    max_frame_num_to_track=video_frames.shape[0],
+                    show_progress_bar=False,
+                ):
                     processed_outputs = self.sam3_processor.postprocess_outputs(inference_session, model_outputs)
                     outputs_per_frame[model_outputs.frame_idx] = processed_outputs
                 for frame_idx, processed_outputs in outputs_per_frame.items():
-                    if processed_outputs['masks'].shape[0] != 0:
-                        mono_depths[frame_idx]["mask"] = (mono_depths[frame_idx]["mask"][0] & ~processed_outputs["masks"][0])[None]
+                    if processed_outputs["masks"].shape[0] != 0:
+                        mono_depths[frame_idx]["mask"] = (
+                            mono_depths[frame_idx]["mask"][0] & ~processed_outputs["masks"][0]
+                        )[None]
 
             # Initialize the cache for the current video.
             video_align_cache[video_name] = {
@@ -1436,31 +1592,50 @@ class PanoramaMemoryBank:
                 mono_depth[~mono_depth_mask] = 0
 
                 # Precompute masks that depend only on mono_depth so every branch can store them in the cache.
-                mono_edge_mask = ~torch.from_numpy(utils3d.numpy.depth_edge(mono_depth.cpu().numpy(), rtol=0.05)).to(self.device).bool()
+                mono_edge_mask = (
+                    ~torch.from_numpy(utils3d.numpy.depth_edge(mono_depth.cpu().numpy(), rtol=0.05))
+                    .to(self.device)
+                    .bool()
+                )
                 depth_filter = torch.median(mono_depth[mono_depth > 0]) * 8
                 far_mask = mono_depth > depth_filter
 
                 if debug_mode:
-                    os.makedirs(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}", exist_ok=True)
-                    gen_frames[local_i].save(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-image.png")
+                    os.makedirs(
+                        f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}",
+                        exist_ok=True,
+                    )
+                    gen_frames[local_i].save(
+                        f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-image.png"
+                    )
                     mask_ = mono_depths[local_i]["mask"][0].cpu().numpy()
                     mask_ = Image.fromarray((mask_ * 255).astype(np.uint8))
-                    mask_.save(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-mono-mask.png")
+                    mask_.save(
+                        f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-mono-mask.png"
+                    )
 
                 # == Global PCD Rendering (obtaining guided_depth) ==
                 first_align_result = "success"
                 guided_depth, guided_depth_mask, guided_normal = None, None, None
                 try:
-                    guided_depth, guided_depth_mask, guided_normal = get_guided_depth_infos_v2(w2c=updated_tar_w2cs[local_i], K=updated_tar_Ks[local_i],
-                                                                                               prev_points3d=self.global_pcd.vertices, prev_normal=self.global_normal,
-                                                                                               height=self.image_height, width=self.image_width, device=self.device)
+                    guided_depth, guided_depth_mask, guided_normal = get_guided_depth_infos_v2(
+                        w2c=updated_tar_w2cs[local_i],
+                        K=updated_tar_Ks[local_i],
+                        prev_points3d=self.global_pcd.vertices,
+                        prev_normal=self.global_normal,
+                        height=self.image_height,
+                        width=self.image_width,
+                        device=self.device,
+                    )
                     guided_depth_np = guided_depth.cpu().numpy()
                     # Compute percentile maps for guided depth and mono depth.
                     guided_mono_mask = (guided_depth_mask & mono_depth_mask).cpu().numpy()
                     mono_depth_np = mono_depth.cpu().numpy()
                     guided_depth_percentile = compute_depth_percentile_map(guided_depth_np, guided_mono_mask)
                     mono_depth_percentile = compute_depth_percentile_map(mono_depth_np, guided_mono_mask)
-                    percentile_mask = np.abs(guided_depth_percentile - mono_depth_percentile) > self.percentile_threshold
+                    percentile_mask = (
+                        np.abs(guided_depth_percentile - mono_depth_percentile) > self.percentile_threshold
+                    )
                     percentile_mask = torch.from_numpy(percentile_mask).bool().to(self.device)
                     guided_depth_mask = guided_depth_mask & ~percentile_mask
 
@@ -1470,33 +1645,77 @@ class PanoramaMemoryBank:
                         mono_normal_vis = mono_depths[local_i]["normal"][0]  # [H, W, 3], value range [-1, 1].
                         if isinstance(mono_normal_vis, torch.Tensor):
                             mono_normal_vis = mono_normal_vis.cpu().numpy()
-                        mono_normal_rgb = ((mono_normal_vis + 1.0) / 2.0 * 255.0).clip(0, 255).astype(np.uint8)  # [H, W, 3]
+                        mono_normal_rgb = (
+                            ((mono_normal_vis + 1.0) / 2.0 * 255.0).clip(0, 255).astype(np.uint8)
+                        )  # [H, W, 3]
 
                         # Save visualization results.
-                        os.makedirs(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}", exist_ok=True)
-                        colorize_depth(guided_depth_percentile, colormap="turbo", save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-guided-percentile.png")
-                        colorize_depth(mono_depth_percentile, colormap="turbo", save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-mono-percentile.png")
-                        colorize_depth(mono_depth_color, colormap="turbo", save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-mono.png")
-                        Image.fromarray(mono_normal_rgb).save(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-mono-normal.png")
-                        colorize_depth(np.abs(guided_depth_percentile - mono_depth_percentile), colormap="turbo", show_colorbar=True, colorbar_label="Percentile Abs Sub",
-                                       save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-percentile-abssub.png")
+                        os.makedirs(
+                            f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}",
+                            exist_ok=True,
+                        )
+                        colorize_depth(
+                            guided_depth_percentile,
+                            colormap="turbo",
+                            save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-guided-percentile.png",
+                        )
+                        colorize_depth(
+                            mono_depth_percentile,
+                            colormap="turbo",
+                            save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-mono-percentile.png",
+                        )
+                        colorize_depth(
+                            mono_depth_color,
+                            colormap="turbo",
+                            save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-mono.png",
+                        )
+                        Image.fromarray(mono_normal_rgb).save(
+                            f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-mono-normal.png"
+                        )
+                        colorize_depth(
+                            np.abs(guided_depth_percentile - mono_depth_percentile),
+                            colormap="turbo",
+                            show_colorbar=True,
+                            colorbar_label="Percentile Abs Sub",
+                            save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-percentile-abssub.png",
+                        )
                         percentile_mask_pil = Image.fromarray(percentile_mask.cpu().numpy().astype(np.uint8) * 255)
-                        percentile_mask_pil.save(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-percentile-mask.png")
-                        colorize_depth(guided_depth_np, save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-guided-depth.png")
+                        percentile_mask_pil.save(
+                            f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-percentile-mask.png"
+                        )
+                        colorize_depth(
+                            guided_depth_np,
+                            save_path=f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-guided-depth.png",
+                        )
 
                     if guided_depth_mask.float().mean() < self.valid_threshold:
-                        color_print(f"[Alignment Rank{self.rank}] [Frame {view_id}/{traj_id}/{fname}] [Warning] Guidance mask ratio: {guided_depth_mask.float().mean():.4f} <= {self.valid_threshold}", "warning")
+                        color_print(
+                            f"[Alignment Rank{self.rank}] [Frame {view_id}/{traj_id}/{fname}] [Warning] Guidance mask ratio: {guided_depth_mask.float().mean():.4f} <= {self.valid_threshold}",
+                            "warning",
+                        )
                         first_align_result = "warning"
                     else:
-                        color_print(f"[Alignment Rank{self.rank}] [Frame {view_id}/{traj_id}/{fname}] [Success] Guidance mask ratio: {guided_depth_mask.float().mean():.4f},"
-                                    f" depth percentile error ratio: {percentile_mask.float().sum() / (guided_mono_mask.sum() + 1e-7):.5f}", "info")
+                        color_print(
+                            f"[Alignment Rank{self.rank}] [Frame {view_id}/{traj_id}/{fname}] [Success] Guidance mask ratio: {guided_depth_mask.float().mean():.4f},"
+                            f" depth percentile error ratio: {percentile_mask.float().sum() / (guided_mono_mask.sum() + 1e-7):.5f}",
+                            "info",
+                        )
                 except Exception as e:
-                    color_print(f"[Alignment Rank{self.rank}] [Frame {view_id}/{traj_id}/{fname}] [Failed] Error in rendering guidance depth with Exception: {e}...", "error")
+                    color_print(
+                        f"[Alignment Rank{self.rank}] [Frame {view_id}/{traj_id}/{fname}] [Failed] Error in rendering guidance depth with Exception: {e}...",
+                        "error",
+                    )
                     first_align_result = "failed"
 
-                if first_align_result in ("warning", "failed"):  # If guidance depth rendering fails, record the failed frame.
+                if first_align_result in (
+                    "warning",
+                    "failed",
+                ):  # If guidance depth rendering fails, record the failed frame.
                     video_align_cache[video_name]["frames"][local_i] = {
-                        "gi": gi, "fname": fname, "k": None, "b": None,
+                        "gi": gi,
+                        "fname": fname,
+                        "k": None,
+                        "b": None,
                         "fail_reason": first_align_result,
                         "mono_depth": mono_depth.cpu(),
                         "mono_depth_mask": mono_depth_mask.cpu(),
@@ -1515,22 +1734,33 @@ class PanoramaMemoryBank:
                 if guided_normal is not None:
                     pred_normal = pred_normal_world.reshape(self.image_height, self.image_width, 3)
                     normal_angle_diff = compute_normal_angles(guided_normal, pred_normal)
-                    normal_mask = (normal_angle_diff <= 90)
+                    normal_mask = normal_angle_diff <= 90
                 else:
                     normal_mask = torch.ones_like(mono_depth_mask).bool()
 
                 valid_mask = guided_depth_mask & mono_depth_mask & mono_edge_mask & normal_mask
 
                 if debug_mode:
-                    os.makedirs(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}", exist_ok=True)
+                    os.makedirs(
+                        f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}",
+                        exist_ok=True,
+                    )
                     valid_mask_np = valid_mask.cpu().numpy()
                     valid_mask_pil = Image.fromarray(valid_mask_np.astype(np.uint8) * 255)
-                    valid_mask_pil.save(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-valid-mask.png")
+                    valid_mask_pil.save(
+                        f"{self.root_path}/render_results/{self.results_path}/tmp_debug/{view_id}-{traj_id}/{fname}-valid-mask.png"
+                    )
 
                 if valid_mask.float().mean() < 0.05:
-                    color_print(f"Rank{self.rank}: Too little overlapping masks are detected for {view_id}/{traj_id}/{fname}. skip...", "error")
+                    color_print(
+                        f"Rank{self.rank}: Too little overlapping masks are detected for {view_id}/{traj_id}/{fname}. skip...",
+                        "error",
+                    )
                     video_align_cache[video_name]["frames"][local_i] = {
-                        "gi": gi, "fname": fname, "k": None, "b": None,
+                        "gi": gi,
+                        "fname": fname,
+                        "k": None,
+                        "b": None,
                         "fail_reason": "too_little_overlap",
                         "mono_depth": mono_depth.cpu(),
                         "mono_depth_mask": mono_depth_mask.cpu(),
@@ -1545,18 +1775,26 @@ class PanoramaMemoryBank:
                     min_samples=100,
                     estimator=ConstrainedLinearRegression(min_coef=1e-4, max_bias=[-10.0, 10.0]),
                     stop_probability=0.995,
-                    random_state=42
+                    random_state=42,
                 )
 
                 mono_inv_depth = 1.0 / mono_depth
                 guided_inv_depth = 1.0 / guided_depth
                 near_mask = valid_mask & (mono_depth <= depth_filter)
                 try:
-                    _ = ransac.fit(mono_inv_depth[near_mask].cpu().numpy().reshape(-1, 1), guided_inv_depth[near_mask].cpu().numpy().reshape(-1, 1))
+                    _ = ransac.fit(
+                        mono_inv_depth[near_mask].cpu().numpy().reshape(-1, 1),
+                        guided_inv_depth[near_mask].cpu().numpy().reshape(-1, 1),
+                    )
                 except:
-                    color_print(f"[Rank{self.rank}] RANSAC failed for {view_id}/{traj_id}/{fname}, continue...", "error")
+                    color_print(
+                        f"[Rank{self.rank}] RANSAC failed for {view_id}/{traj_id}/{fname}, continue...", "error"
+                    )
                     video_align_cache[video_name]["frames"][local_i] = {
-                        "gi": gi, "fname": fname, "k": None, "b": None,
+                        "gi": gi,
+                        "fname": fname,
+                        "k": None,
+                        "b": None,
                         "fail_reason": "ransac_failed",
                         "mono_depth": mono_depth.cpu(),
                         "mono_depth_mask": mono_depth_mask.cpu(),
@@ -1582,9 +1820,12 @@ class PanoramaMemoryBank:
                     "depth_filter": float(depth_filter.item()),  # Depth filtering threshold.
                 }
 
-            n_success = sum(1 for f in video_align_cache[video_name]['frames'].values() if f['k'] is not None)
-            n_failed = sum(1 for f in video_align_cache[video_name]['frames'].values() if f['k'] is None)
-            color_print(f"[Rank{self.rank}] Video {video_name}: {n_success} success, {n_failed} failed, {N_align} total frames.", "info")
+            n_success = sum(1 for f in video_align_cache[video_name]["frames"].values() if f["k"] is not None)
+            n_failed = sum(1 for f in video_align_cache[video_name]["frames"].values() if f["k"] is None)
+            color_print(
+                f"[Rank{self.rank}] Video {video_name}: {n_success} success, {n_failed} failed, {N_align} total frames.",
+                "info",
+            )
 
         # =====================================================================
         # Phase 3: Synchronize k,b results in video_align_cache across processes.
@@ -1617,7 +1858,9 @@ class PanoramaMemoryBank:
         # Print synchronization statistics.
         total_aligned_frames = sum(len(v) for v in global_kb_summary.values())
         total_videos = len(global_kb_summary)
-        rank0_log(f"Alignment Phase 3: Synced k,b from {total_videos} videos, {total_aligned_frames} frames across {self.world_size} ranks.")
+        rank0_log(
+            f"Alignment Phase 3: Synced k,b from {total_videos} videos, {total_aligned_frames} frames across {self.world_size} ranks."
+        )
 
         if self.rank == 0:
             for vname in sorted(global_kb_summary.keys()):
@@ -1626,9 +1869,12 @@ class PanoramaMemoryBank:
                 valid_bs = [v["b"] for v in frames_kb.values() if v["b"] is not None]
                 n_failed = sum(1 for v in frames_kb.values() if v["k"] is None)
                 if valid_ks:
-                    color_print(f"  Video {vname}: {len(valid_ks)} success, {n_failed} failed, "
-                                f"k=[{min(valid_ks):.4f}, {max(valid_ks):.4f}], "
-                                f"b=[{min(valid_bs):.4f}, {max(valid_bs):.4f}]", "info")
+                    color_print(
+                        f"  Video {vname}: {len(valid_ks)} success, {n_failed} failed, "
+                        f"k=[{min(valid_ks):.4f}, {max(valid_ks):.4f}], "
+                        f"b=[{min(valid_bs):.4f}, {max(valid_bs):.4f}]",
+                        "info",
+                    )
                 else:
                     color_print(f"  Video {vname}: 0 success, {n_failed} failed (all frames failed)", "error")
 
@@ -1666,8 +1912,8 @@ class PanoramaMemoryBank:
                 if fdata["k"] is None:
                     inlier_map[li] = False
                 else:
-                    dev = frame_deviations.get((video_name, li), float('inf'))
-                    inlier_map[li] = (dev <= inlier_threshold)
+                    dev = frame_deviations.get((video_name, li), float("inf"))
+                    inlier_map[li] = dev <= inlier_threshold
 
             # Collect local_i and k,b for all inlier frames in this video.
             inlier_frames = [(li, frames[li]["k"], frames[li]["b"]) for li in sorted_local_is if inlier_map[li]]
@@ -1675,7 +1921,9 @@ class PanoramaMemoryBank:
             if not inlier_frames:
                 # All frames in this video are non-inliers, so abandon it.
                 abandoned_videos.append((video_name, "all_outlier"))
-                color_print(f"[Rank{self.rank}] Video {video_name}: ALL frames are outlier/failed, abandoning.", "error")
+                color_print(
+                    f"[Rank{self.rank}] Video {video_name}: ALL frames are outlier/failed, abandoning.", "error"
+                )
                 continue
 
             inlier_local_is = np.array([x[0] for x in inlier_frames])
@@ -1716,7 +1964,9 @@ class PanoramaMemoryBank:
 
         if self.rank == 0 and global_abandoned:
             color_print(f"\n{'=' * 80}", "error")
-            color_print(f"[CRITICAL] Total {len(global_abandoned)} videos abandoned due to severe alignment issues:", "error")
+            color_print(
+                f"[CRITICAL] Total {len(global_abandoned)} videos abandoned due to severe alignment issues:", "error"
+            )
             for vname, reason in global_abandoned:
                 color_print(f"  {vname}: {reason}", "error")
             color_print(f"{'=' * 80}\n", "error")
@@ -1768,13 +2018,20 @@ class PanoramaMemoryBank:
                 aligned_depth = 1.0 / torch.clamp_min((1.0 / torch.clamp_min(mono_depth, eps)) * final_k + final_b, eps)
 
                 # Compute aligned_edge_mask and final_mask.
-                aligned_edge_mask = ~torch.from_numpy(utils3d.numpy.depth_edge(aligned_depth.cpu().numpy(), rtol=0.1)).to(self.device).bool()
+                aligned_edge_mask = (
+                    ~torch.from_numpy(utils3d.numpy.depth_edge(aligned_depth.cpu().numpy(), rtol=0.1))
+                    .to(self.device)
+                    .bool()
+                )
                 combined_edge_mask = mono_edge_mask & aligned_edge_mask & mono_depth_mask
                 final_mask = (aligned_depth >= self.min_depth) & combined_edge_mask & (aligned_depth <= self.max_d)
                 aligned_depth[~final_mask] = 0
 
                 if final_mask.float().sum() < 10:
-                    color_print(f"[Rank{self.rank}] Too few valid points for {video_name}/{fname} after alignment, skipping.", "warning")
+                    color_print(
+                        f"[Rank{self.rank}] Too few valid points for {video_name}/{fname} after alignment, skipping.",
+                        "warning",
+                    )
                     continue
 
                 # Save aligned depth.
@@ -1790,10 +2047,16 @@ class PanoramaMemoryBank:
                 self.ref_depths[gi] = aligned_depth_for_ref.cpu().numpy()
 
                 # Generate point cloud.
-                rgb_colors = torch.from_numpy(np.array(gen_frames[local_i]).reshape(-1, 3)).to(self.device, dtype=torch.float32)
+                rgb_colors = torch.from_numpy(np.array(gen_frames[local_i]).reshape(-1, 3)).to(
+                    self.device, dtype=torch.float32
+                )
                 update_points3d, update_rgb = depth2pcd(
-                    updated_tar_w2cs[local_i], updated_tar_Ks[local_i],
-                    self.points.clone(), aligned_depth, rgb_colors, update_mask
+                    updated_tar_w2cs[local_i],
+                    updated_tar_Ks[local_i],
+                    self.points.clone(),
+                    aligned_depth,
+                    rgb_colors,
+                    update_mask,
                 )
                 update_points3d = update_points3d.cpu().numpy()
                 update_rgb = update_rgb.cpu().numpy().astype(np.uint8)
@@ -1803,17 +2066,23 @@ class PanoramaMemoryBank:
                     video_aligned_data[video_name]["points"] = update_points3d
                     video_aligned_data[video_name]["colors"] = update_rgb
                 else:
-                    video_aligned_data[video_name]["points"] = np.concatenate([video_aligned_data[video_name]["points"], update_points3d], axis=0)
-                    video_aligned_data[video_name]["colors"] = np.concatenate([video_aligned_data[video_name]["colors"], update_rgb], axis=0)
+                    video_aligned_data[video_name]["points"] = np.concatenate(
+                        [video_aligned_data[video_name]["points"], update_points3d], axis=0
+                    )
+                    video_aligned_data[video_name]["colors"] = np.concatenate(
+                        [video_aligned_data[video_name]["colors"], update_rgb], axis=0
+                    )
 
                 # Record camera information by directly referencing global ref_Ks/ref_w2cs to avoid redundant storage.
                 video_camera_dicts[video_name][fname] = {
                     "intrinsic": self.ref_Ks[gi].cpu().numpy().tolist(),
-                    "extrinsic": self.ref_w2cs[gi].cpu().numpy().tolist()
+                    "extrinsic": self.ref_w2cs[gi].cpu().numpy().tolist(),
                 }
 
             n_aligned = len(video_camera_dicts.get(video_name, {}))
-            color_print(f"[Rank{self.rank}] Video {video_name}: {n_aligned} frames aligned with depth & pointcloud.", "info")
+            color_print(
+                f"[Rank{self.rank}] Video {video_name}: {n_aligned} frames aligned with depth & pointcloud.", "info"
+            )
 
         # =====================================================================
         # Phase 6.5: Filter outlier points after video-level aggregation with Statistical Outlier Removal.
@@ -1823,8 +2092,7 @@ class PanoramaMemoryBank:
                 continue
             n_before = vdata["points"].shape[0]
             filtered_points, filtered_colors, _ = statistical_outlier_removal(
-                vdata["points"], vdata["colors"],
-                nb_neighbors=self.pcd_nb_neighbors, std_ratio=self.pcd_std_ratio
+                vdata["points"], vdata["colors"], nb_neighbors=self.pcd_nb_neighbors, std_ratio=self.pcd_std_ratio
             )
             n_after = filtered_points.shape[0]
             n_removed = n_before - n_after
@@ -1834,7 +2102,7 @@ class PanoramaMemoryBank:
                 color_print(
                     f"[Rank{self.rank}] SOR filter {video_name}: {n_before} -> {n_after} points "
                     f"(removed {n_removed}, {n_removed / n_before * 100:.1f}%)",
-                    "info"
+                    "info",
                 )
 
         # =====================================================================
@@ -1863,7 +2131,10 @@ class PanoramaMemoryBank:
 
         if self.rank == 0:
             total_points = sum(v["points"].shape[0] for v in self.global_points.values())
-            color_print(f"[Phase 7] Global points merged: {len(self.global_points)} videos, {total_points} total points.", "info")
+            color_print(
+                f"[Phase 7] Global points merged: {len(self.global_points)} videos, {total_points} total points.",
+                "info",
+            )
 
         # Save each video's point cloud in debug mode.
         if debug_mode:
@@ -1879,6 +2150,8 @@ class PanoramaMemoryBank:
                     temp_colors = temp_colors[downsampled_indices]
                 os.makedirs(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/pointclouds", exist_ok=True)
                 temp_pcd = trimesh.PointCloud(vertices=temp_points, colors=temp_colors)
-                temp_pcd.export(f"{self.root_path}/render_results/{self.results_path}/tmp_debug/pointclouds/{view_id}-{traj_id}-pcd.ply")
+                temp_pcd.export(
+                    f"{self.root_path}/render_results/{self.results_path}/tmp_debug/pointclouds/{view_id}-{traj_id}-pcd.ply"
+                )
 
         dist.barrier()
