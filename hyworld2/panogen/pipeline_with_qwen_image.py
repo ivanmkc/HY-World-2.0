@@ -121,6 +121,7 @@ class HunyuanPanoPipeline:
         lora_path: str = DEFAULT_LORA_PATH,
         lora_subfolder: str = DEFAULT_LORA_SUBFOLDER,
         torch_dtype: torch.dtype = torch.bfloat16,
+        cpu_offload: bool = False,
     ) -> "HunyuanPanoPipeline":
         """Load model weights (and LoRA) and return a ready-to-use pipeline.
 
@@ -137,12 +138,29 @@ class HunyuanPanoPipeline:
                 that contains the LoRA weights file.  Ignored when
                 ``lora_path`` is ``None``.
             torch_dtype: Torch dtype for the model. Defaults to bfloat16.
+            cpu_offload: Stream components to the GPU as they are called, instead of
+                holding the whole 53.76 GiB pipeline resident. Required below 80 GB.
         """
         print(f"[Init] Loading base model from {pretrained_model_name_or_path} ...")
         pipe = PanoDiffusionPipeline.from_pretrained(
             pretrained_model_name_or_path,
             torch_dtype=torch_dtype,
-        ).to("cuda")
+        )
+        # Qwen-Image-Edit-2509 is 53.76 GiB in bf16 -- 20.43B of transformer plus 8.29B of
+        # text encoder. `.to("cuda")` unconditionally therefore requires an 80 GB card, and
+        # on anything smaller it fails before the LoRA is even loaded. That is a placement
+        # decision baked into the loader rather than a real hardware floor: diffusers can
+        # stream whole components on and off as the pipeline calls them.
+        #
+        # enable_model_cpu_offload keeps only the component currently executing resident,
+        # so the peak is the largest single component rather than their sum. It is slower
+        # by the cost of moving weights across PCIe once per component per inference, which
+        # for a 40-step panorama is a small fraction of the total.
+        if cpu_offload:
+            print("[Init] CPU offload enabled: components stream to GPU as they are called.")
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to("cuda")
         print("[Init] Base model loaded successfully!")
 
         if lora_path is not None:
@@ -283,6 +301,9 @@ def parse_args():
     parser.add_argument("--save", type=str, default=None,
                         help="Path to save the generated image "
                              "(default: <input_stem>_panorama.png)")
+    parser.add_argument("--cpu-offload", action="store_true",
+                        help="Stream pipeline components to the GPU as they are called. The bf16 base is "
+                             "53.76 GiB, so this is required on any card below 80 GB.")
     parser.add_argument("--reproduce", action="store_true",
                         help="Whether to reproduce the results (fix all RNGs)")
 
@@ -299,6 +320,7 @@ def main(args):
         args.pretrained_model_name_or_path,
         lora_path=args.lora_path if args.lora_path else None,
         lora_subfolder=args.lora_subfolder,
+        cpu_offload=args.cpu_offload,
     )
 
     # Run inference
