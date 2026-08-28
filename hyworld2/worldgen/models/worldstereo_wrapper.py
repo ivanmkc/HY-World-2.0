@@ -47,6 +47,7 @@ from .pipelines.pipeline_dmd_keyframe import RefKFDMDGeneratorPipeline
 from .pipelines.pipeline_pcd_keyframe import KFPCDControllerPipeline
 from .pipelines.pipeline_ref_keyframe import KFPCDControllerRefPipeline
 from .worldstereo import WorldStereoModel, WorldStereoRefSModel
+
 try:
     from ..src.general_utils import rank0_log
 except ImportError:
@@ -55,6 +56,7 @@ except ImportError:
 # ── suppress noisy third-party logs ───────────────────────────────────
 import logging
 import warnings
+
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["DIFFUSERS_VERBOSITY"] = "error"
@@ -77,9 +79,11 @@ logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("filelock").setLevel(logging.ERROR)
 
 from transformers.utils import logging as hf_logging
+
 hf_logging.set_verbosity_error()
 
 from diffusers.utils import logging as diffusers_logging
+
 diffusers_logging.set_verbosity_error()
 
 # torch.compile / inductor verbose output
@@ -151,6 +155,7 @@ class WorldStereo:
                 raise FileNotFoundError(f"model.safetensors not found at {safetensors_path!r}")
         else:
             from huggingface_hub import hf_hub_download
+
             json_cfg_path = hf_hub_download(
                 repo_id=repo_id,
                 filename="config.json",
@@ -169,10 +174,7 @@ class WorldStereo:
 
         model_type = subfolder
         if model_type not in SUPPORTED_MODEL_TYPES:
-            raise ValueError(
-                f"Unsupported model_type {model_type!r}. "
-                f"Expected one of {SUPPORTED_MODEL_TYPES}."
-            )
+            raise ValueError(f"Unsupported model_type {model_type!r}. Expected one of {SUPPORTED_MODEL_TYPES}.")
 
         transformer = cls._load_transformer(
             cfg,
@@ -190,7 +192,9 @@ class WorldStereo:
         image_processor = CLIPImageProcessor.from_pretrained(
             cfg.base_model, do_rescale=False, subfolder="image_processor", local_files_only=local_files_only
         )
-        tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, subfolder="tokenizer", local_files_only=local_files_only)
+        tokenizer = AutoTokenizer.from_pretrained(
+            cfg.base_model, subfolder="tokenizer", local_files_only=local_files_only
+        )
 
         pipeline = cls._build_pipeline(
             model_type,
@@ -291,12 +295,9 @@ class WorldStereo:
             if not keys:
                 return
             from collections import Counter
+
             # Count unloaded parameters
-            total_params = sum(
-                transformer.state_dict()[k].numel()
-                for k in keys
-                if k in transformer.state_dict()
-            )
+            total_params = sum(transformer.state_dict()[k].numel() for k in keys if k in transformer.state_dict())
             # Count occurrence frequency of each field (split by ".") across all keys, take top-2
             field_counter: Counter[str] = Counter()
             for k in keys:
@@ -349,9 +350,17 @@ class WorldStereo:
         from transformers.modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling
 
         # ---- text encoder ----
-        rank0_log("Loading TextEncoder (UMT5)…")
+        # float32 by default, as upstream has it. WORLDSTEREO_TEXT_ENCODER_DTYPE=bfloat16
+        # halves it, which matters on a host with more ranks than headroom: the weights are
+        # 22.72 GB on disk and upcasting to fp32 makes them roughly 45 GB resident, so four
+        # ranks want ~180 GB of a 340 GB machine before the transformer, the VAE and MoGe
+        # are counted. A run wedged for two hours at exactly this line is what prompted it.
+        # Opt-in, because a T5 encoder is the one part of a pipeline like this with a real
+        # reason to stay in fp32.
+        _text_dtype = getattr(torch, os.environ.get("WORLDSTEREO_TEXT_ENCODER_DTYPE", "float32"))
+        rank0_log(f"Loading TextEncoder (UMT5) in {_text_dtype}…")
         text_encoder = UMT5EncoderModel.from_pretrained(
-            cfg.base_model, subfolder="text_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
+            cfg.base_model, subfolder="text_encoder", torch_dtype=_text_dtype, local_files_only=local_files_only
         ).eval()
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching text_encoder.encoder.embed_tokens for transformers>=5.0.0", "WARNING")
@@ -389,7 +398,9 @@ class WorldStereo:
                 return BaseModelOutput(last_hidden_state=hidden_states, hidden_states=encoder_states)
 
             image_clip.vision_model.forward = types.MethodType(_clip_vision_forward, image_clip.vision_model)
-            image_clip.vision_model.encoder.forward = types.MethodType(_clip_encoder_forward, image_clip.vision_model.encoder)
+            image_clip.vision_model.encoder.forward = types.MethodType(
+                _clip_encoder_forward, image_clip.vision_model.encoder
+            )
 
         # ---- VAE ----
         vae_dtype = _get_half_dtype()
@@ -402,7 +413,8 @@ class WorldStereo:
         if fsdp:
             fsdp_kwargs = dict(
                 mp_policy=MixedPrecisionPolicy(
-                    param_dtype=torch.float32, reduce_dtype=torch.float32,
+                    param_dtype=torch.float32,
+                    reduce_dtype=torch.float32,
                 ),
                 mesh=device_mesh["rep", "shard"],
                 reshard_after_forward=True,
