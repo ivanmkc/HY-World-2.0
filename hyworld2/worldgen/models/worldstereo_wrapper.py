@@ -184,6 +184,7 @@ class WorldStereo:
             fsdp=fsdp,
             device_mesh=device_mesh,
             device=device,
+            local_files_only=local_files_only,
         )
 
         text_encoder, image_clip, vae = cls._load_aux(
@@ -253,17 +254,25 @@ class WorldStereo:
         fsdp: bool,
         device_mesh,
         device,
+        local_files_only: bool = False,
     ):
 
         half_dtype = _get_half_dtype()
         rank0_log(f"Loading transformer ({model_type})… dtype={half_dtype}")
 
+        # local_files_only is threaded through every other from_pretrained in this file and
+        # was missing from these two -- which are the largest. Wan2.1's transformer subfolder
+        # is 65.58 GB, so without it four torchrun ranks each resolve and fetch that through
+        # the Hub API at once: roughly 262 GB of concurrent download behind huggingface_hub's
+        # per-repo lock, printing nothing while it happens. That is the stall that consumed
+        # several multi-hour runs before HF_HUB_OFFLINE turned it into a named error.
         if model_type == "worldstereo-camera":
             transformer = WorldStereoModel.from_pretrained(
                 cfg.base_model,
                 subfolder="transformer",
                 controlnet_cfg=cfg.controlnet_cfg,
                 torch_dtype=half_dtype,
+                local_files_only=local_files_only,
             )
         else:
             transformer = WorldStereoRefSModel.from_pretrained(
@@ -271,6 +280,7 @@ class WorldStereo:
                 subfolder="transformer",
                 controlnet_cfg=cfg.controlnet_cfg,
                 torch_dtype=half_dtype,
+                local_files_only=local_files_only,
             )
 
         rank0_log("Building ControlNet…")
