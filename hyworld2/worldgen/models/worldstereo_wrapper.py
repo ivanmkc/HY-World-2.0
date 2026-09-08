@@ -301,6 +301,21 @@ class WorldStereo:
 
         result = transformer.load_state_dict(weights, strict=False)
 
+        # Release the checkpoint before FSDP wraps anything.
+        #
+        # load_state_dict copies into the model's existing parameters, so once it returns
+        # this dict is a second, redundant full copy of the checkpoint in host RAM --
+        # 34.86 GB of it for worldstereo-memory-dmd. Holding it until the function returns
+        # means every rank carries backbone + checkpoint simultaneously through the FSDP
+        # wrap, which is ~68 GB per rank; four ranks peaked at 315.4 GB of a 334 GB host
+        # and were OOM-killed. Dropping it here is what makes four ranks affordable, and
+        # four ranks is what makes the shard small enough to leave room on a 40 GB card.
+        #
+        # Nothing below reads it: _summarize_keys works from transformer.state_dict(), and
+        # the FSDP branch only touches the module.
+        del weights
+        gc.collect()
+
         def _summarize_keys(keys: list[str], label: str) -> None:
             if not keys:
                 return
