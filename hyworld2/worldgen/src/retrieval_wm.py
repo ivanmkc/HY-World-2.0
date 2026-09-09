@@ -1273,7 +1273,35 @@ class PanoramaMemoryBank:
                     "gs",
                 ]
                 color_print(f"[Rank0] Running World Mirror inference: {' '.join(wm_cmd)}", "info")
-                result = subprocess.run(wm_cmd, cwd="..")
+                # A clean environment, or the nested torchrun joins its parent's job.
+                #
+                # This is a torchrun launched from inside a torchrun, and subprocess
+                # inherits os.environ -- including everything the outer torchelastic agent
+                # exported. The child sees TORCHELASTIC_USE_AGENT_STORE and concludes it
+                # should use the existing agent store rather than stand up its own, so it
+                # waits on the PARENT's rendezvous for keys belonging to a group it is not
+                # in, then dies: "DistStoreError: wait timeout after 600000ms". The
+                # "server socket on 29500 has failed to bind ... so ignoring the error"
+                # line just above it is the same collision seen from the other side.
+                #
+                # So the child gets its own rendezvous: the inherited elastic and
+                # distributed variables are stripped, and MASTER_PORT is moved off the
+                # parent's 29500. Everything else -- caches, offline flags, CUDA
+                # visibility -- is inherited deliberately and kept.
+                _inherited = (
+                    "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
+                    "GROUP_RANK", "GROUP_WORLD_SIZE",
+                    "ROLE_RANK", "ROLE_NAME", "ROLE_WORLD_SIZE",
+                    "MASTER_ADDR", "MASTER_PORT",
+                )
+                child_env = {
+                    k: v
+                    for k, v in os.environ.items()
+                    if k not in _inherited and not k.startswith("TORCHELASTIC_")
+                }
+                child_env["MASTER_ADDR"] = "127.0.0.1"
+                child_env["MASTER_PORT"] = os.getenv("WORLDSTEREO_WM_MASTER_PORT", "29600")
+                result = subprocess.run(wm_cmd, cwd="..", env=child_env)
 
                 if result.returncode != 0:
                     raise RuntimeError(f"World Mirror inference failed with return code {result.returncode}")
