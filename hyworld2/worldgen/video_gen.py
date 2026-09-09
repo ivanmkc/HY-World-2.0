@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import os
+from datetime import timedelta
 from glob import glob
 
 import imagesize
@@ -59,10 +60,23 @@ if __name__ == "__main__":
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(local_rank)
+    # A collective timeout that outlasts the WorldMirror subprocess.
+    #
+    # apply_worldmirror has rank 0 shell out to a second torchrun for
+    # `-m worldrecon.pipeline` while ranks 1..n-1 wait at dist.barrier(). That barrier runs
+    # on gloo, whose default timeout is 30 minutes, and the subprocess is slower than that:
+    # run 20260909-053434 died with the workers reporting "Timed out waiting 1800000ms" at
+    # exactly 30:00 while rank 0 was still in do_wait on its child, 34:44 into the
+    # inference and not yet finished. Nothing was wrong -- the barrier was simply shorter
+    # than the work it was waiting on.
+    #
+    # Four hours by default, because the failure mode this replaces cost a whole run and
+    # the cost of an over-long timeout is bounded by the stage timeout above it.
     dist.init_process_group(
         backend="cpu:gloo,cuda:nccl",
         rank=rank,
         world_size=world_size,
+        timeout=timedelta(seconds=int(os.getenv("WORLDSTEREO_PG_TIMEOUT_S", "14400"))),
     )
     device_num = torch.cuda.device_count()
     mesh_size = (world_size // device_num, device_num)
