@@ -1245,9 +1245,18 @@ class PanoramaMemoryBank:
         torch.cuda.empty_cache()
         if self.rank == 0:
             if not (skip_exist and os.path.exists(f"{self.world_mirror_dir}/name_map.json")):
+                # A port of its own, on the command line rather than in the environment.
+                #
+                # torchrun SETS MASTER_PORT for the workers it spawns; it does not READ it
+                # for its own rendezvous, which always defaults to 29500. The parent agent
+                # already holds 29500, so the child died with EADDRINUSE even after the
+                # inherited elastic variables were stripped -- the environment fix was
+                # necessary and, on its own, not sufficient.
+                _wm_port = os.getenv("WORLDSTEREO_WM_MASTER_PORT", "29600")
                 wm_cmd = [
                     "torchrun",
                     f"--nproc_per_node={self.world_size}",
+                    f"--master_port={_wm_port}",
                     "-m",
                     "worldrecon.pipeline",
                     "--input_path",
