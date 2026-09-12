@@ -461,6 +461,28 @@ class WorldStereo:
             image_clip = image_clip.to(device=device)
 
         vae = vae.to(device=device)
+
+        # Tile the VAE, because the card is already exactly full at the default resolution.
+        #
+        # Both successful runs peaked at 40,373 MiB of a 39,490 MiB card during stage
+        # video -- not close to the limit, at it. Nothing can be asked of a higher
+        # --splitted_resolution until something gives memory back, and the VAE is the
+        # cheapest place to find it: diffusers ships AutoencoderKLWan with use_tiling
+        # False, so it decodes the whole clip in one piece, which for video is the single
+        # largest allocation in the stage.
+        #
+        # Tiles are 256x256 with a 192 stride, so neighbours overlap by 64 pixels and are
+        # blended (blend_v/blend_h) rather than butted together. That matters more here
+        # than in a normal pipeline: these frames are not the deliverable, they are what
+        # the 3DGS trains on, so a visible seam would be baked into the world rather than
+        # merely looked at.
+        #
+        # On by default. Off via WORLDSTEREO_VAE_TILING=0, which is how to tell a tiling
+        # artefact apart from a reconstruction one if the world ever looks wrong in a grid.
+        if os.environ.get("WORLDSTEREO_VAE_TILING", "1") != "0":
+            vae.enable_tiling()
+            rank0_log("VAE tiling enabled (256px tiles, 192 stride).")
+
         return text_encoder, image_clip, vae
 
     @staticmethod
