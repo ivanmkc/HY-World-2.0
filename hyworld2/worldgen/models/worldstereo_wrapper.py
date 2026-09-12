@@ -23,6 +23,7 @@ supported values:
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import os
@@ -125,7 +126,7 @@ def _fsdp_cpu_offload(component: str) -> OffloadPolicy:
     return OffloadPolicy()
 
 
-def _report_memory(label: str) -> None:
+def report_memory(label: str) -> None:
     """Print the card's real high-water mark, because every number below was inferred.
 
     The budget for this stage was assembled from safetensors headers and two OOM messages,
@@ -145,6 +146,40 @@ def _report_memory(label: str) -> None:
         f"peak_since_last={torch.cuda.max_memory_allocated() / gib:.2f} GiB"
     )
     torch.cuda.reset_peak_memory_stats()
+
+
+@contextlib.contextmanager
+def parked_on_cpu(modules, *, device):
+    """Park models on the host for the duration of a block that does not call them.
+
+    Two perception models are built once and then left on the card for the whole stage,
+    although neither is reachable from the diffusion pipeline:
+
+      MoGe-2 ViT-L      video_gen.py:104, used only by memory_bank.alignment()
+                        (retrieval_wm.py:1606), which runs AFTER every trajectory is
+                        generated. model.pt is 1,323,815,904 bytes of fp32 -> 1.23 GiB.
+      dinov2-base       CameraSelector._load_model, retrieval_wm.py:489, used only by
+                        memory_bank.retrieval() (retrieval_wm.py:1106), which runs
+                        immediately BEFORE the pipeline call and not during it.
+                        86.6M fp32 -> 0.32 GiB.
+
+    Neither is sharded, so every rank pays the full price, and 1.55 GiB of a 39.49 GiB card
+    is idle through the entire denoise loop. Moving them out and back costs 1.67 GB each way
+    over PCIe per trajectory -- about 0.17 s against the ~25 s a trajectory takes.
+
+    Enabled by WORLDSTEREO_IDLE_MODEL_OFFLOAD=1. Off by default; it cannot change any output,
+    but nor should a memory saving arrive without a flag to attribute it to.
+    """
+    live = [m for m in modules if m is not None] if _env_on("WORLDSTEREO_IDLE_MODEL_OFFLOAD") else []
+    for module in live:
+        module.to("cpu")
+    if live:
+        torch.cuda.empty_cache()
+    try:
+        yield
+    finally:
+        for module in live:
+            module.to(device)
 
 
 def _get_half_dtype() -> torch.dtype:
@@ -394,6 +429,23 @@ class WorldStereo:
         _summarize_keys(result.unexpected_keys, "Unexpected keys")
         _summarize_keys(result.missing_keys, "Missing keys")
 
+        # Out of autograd before the wrap, not after.
+        #
+        # This stage never calls backward: the DMD pipeline runs mode="test", which takes
+        # the torch.no_grad() branch at pipeline_dmd_keyframe.py:266 for every step. But
+        # requires_grad is still True on the controlnet (build_controlnet re-enables it at
+        # worldstereo.py:153), and requires_grad is exactly what decides whether autocast
+        # CACHES its down-cast of a parameter -- see the note in _load_aux, where the same
+        # switch is worth 9.80 GiB. Nothing here is fp32 under a bf16 autocast, so the
+        # transformer itself has nothing to cache; it is set for uniformity and because a
+        # mixed-requires_grad FSDP group is a foot-gun nobody needs.
+        #
+        # Before fully_shard, because FSDP copies requires_grad onto the unsharded parameter
+        # when it first materialises it (_fsdp_param.py:537).
+        if _env_on("WORLDSTEREO_INFER_NO_GRAD"):
+            transformer.requires_grad_(False)
+            rank0_log("Transformer parameters set requires_grad=False (inference only).")
+
         if fsdp:
             fsdp_kwargs = dict(
                 mp_policy=MixedPrecisionPolicy(
@@ -402,6 +454,7 @@ class WorldStereo:
                 ),
                 mesh=device_mesh["rep", "shard"],
                 reshard_after_forward=True,
+                offload_policy=_fsdp_cpu_offload("transformer"),
             )
             transformer = transformer.to(half_dtype)
             for layer in transformer.blocks:
@@ -415,6 +468,7 @@ class WorldStereo:
 
         gc.collect()
         torch.cuda.empty_cache()
+        report_memory("transformer loaded")
         return transformer.eval()
 
     @staticmethod
@@ -441,9 +495,17 @@ class WorldStereo:
         text_encoder = torch.compile(text_encoder)
 
         # ---- image encoder ----
-        rank0_log("Loading ImageEncoder (CLIP)…")
+        # float32 by default, as upstream has it, and as upstream has it for no reason: Wan
+        # ships image_encoder/model.safetensors at 1.264 GB for 630.6M parameters, which is
+        # fp16 on disk. Loading it fp32 re-inflates it to 2.52 GB and recovers no precision
+        # that the checkpoint ever had. WORLDSTEREO_IMAGE_ENCODER_DTYPE=bfloat16 halves both
+        # the 0.59 GiB resident shard and the 2.35 GiB all-gather that one CLIP forward does.
+        # Opt-in, in the same shape as the text encoder above, because the two are the same
+        # decision and should read the same way.
+        _clip_dtype = getattr(torch, os.environ.get("WORLDSTEREO_IMAGE_ENCODER_DTYPE", "float32"))
+        rank0_log(f"Loading ImageEncoder (CLIP) in {_clip_dtype}…")
         image_clip = CLIPVisionModel.from_pretrained(
-            cfg.base_model, subfolder="image_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
+            cfg.base_model, subfolder="image_encoder", torch_dtype=_clip_dtype, local_files_only=local_files_only
         ).eval()
         if _tr.__version__ >= "5.0.0":
             rank0_log("Patching CLIP vision forward for transformers>=5.0.0", "WARNING")
@@ -483,24 +545,83 @@ class WorldStereo:
         ).eval()
         vae = torch.compile(vae)
 
-        if fsdp:
-            fsdp_kwargs = dict(
-                mp_policy=MixedPrecisionPolicy(
-                    param_dtype=torch.float32,
-                    reduce_dtype=torch.float32,
-                ),
-                mesh=device_mesh["rep", "shard"],
-                reshard_after_forward=True,
-            )
-            for layer in text_encoder.encoder.block:
-                fully_shard(layer, **fsdp_kwargs)
-            fully_shard(text_encoder, **fsdp_kwargs)
-            rank0_log("FSDP wrapping done for T5.")
+        # Take the two encoders out of autograd, which is the largest single saving in this
+        # file and costs nothing.
+        #
+        # video_gen.py:284 opens ONE torch.autocast("cuda", bfloat16) around the whole
+        # pipeline call. Every autocast region below it is nested, and autocast clears its
+        # weight cache only when the OUTERMOST region exits -- so anything cached while
+        # encoding the prompt is still on the card through all four denoise steps and the
+        # VAE decode.
+        #
+        # What gets cached is a bf16 copy of every fp32 parameter an autocast-listed op
+        # touches, and the condition for caching (ATen's cached_cast) is
+        # `arg.requires_grad() && arg.is_leaf() && !arg.is_view()`. FSDP2's unsharded
+        # parameter is an nn.Parameter built by _fsdp_param.py:537 -- leaf, not a view, and
+        # requires_grad inherited from the sharded one, which is True because
+        # from_pretrained().eval() never clears it. So both encoders qualify:
+        #
+        #   UMT5 block Linears   4.6306B params -> 9.26 GB of bf16 copies -> 8.63 GiB
+        #   CLIP  block Linears  0.6291B params -> 1.26 GB                -> 1.17 GiB
+        #                                                          total    9.80 GiB
+        #
+        # per rank, held from encode_prompt to the end of the pipeline call, on a card with
+        # 39.49 GiB. That is not a guess about the mechanism: an FSDP2 + autocast rig on CPU
+        # reproduces it exactly -- 8 blocks of 67.1M fp32 parameters retain 170.8 MiB inside
+        # the region against a 128.0 MiB predicted cache, and retain 0.0 MiB with
+        # requires_grad False. It also matches where two runs actually died: ws2e and ws2h
+        # both OOMed INSIDE encode_prompt, ws2h on a 738 MiB request, which is exactly one
+        # UMT5 block's fp32 all-gather (192.94M x 4 B = 735.9 MiB).
+        #
+        # requires_grad has no effect on any forward value, so this changes nothing about
+        # the output. It is still a knob, and still off by default, because the saving is
+        # large enough that it should be attributable to a flag rather than to a release.
+        if _env_on("WORLDSTEREO_INFER_NO_GRAD"):
+            text_encoder.requires_grad_(False)
+            image_clip.requires_grad_(False)
+            vae.requires_grad_(False)
+            rank0_log("Aux encoders set requires_grad=False; autocast will not cache their weights.")
 
+        if fsdp:
+            # param_dtype for the aux encoders.
+            #
+            # fp32 as upstream has it, which under WORLDSTEREO_TEXT_ENCODER_DTYPE=bfloat16 is
+            # a round trip that gains nothing: the sharded weights are already bf16, FSDP
+            # upcasts them to fp32 for the all-gather, and the enclosing autocast casts them
+            # straight back down for every matmul. The only thing the upcast buys is a
+            # doubled all-gather buffer -- 735.9 MiB per UMT5 block rather than 368.0 --
+            # and that buffer is the allocation ws2h died on.
+            #
+            # "match" uses each module's own dtype instead. It is not free of consequence:
+            # ops autocast does NOT cast (the RMS norms, the fp32 softmax) would then run in
+            # bf16 rather than fp32, so this is a numerical change and not merely a memory
+            # one. Wan's own release ships umt5-xxl as an "enc-bf16" checkpoint, so bf16 is
+            # defensible -- but it is a second lever, not part of the first one.
+            _aux_param_dtype_env = os.environ.get("WORLDSTEREO_AUX_FSDP_PARAM_DTYPE", "float32")
+
+            def _aux_fsdp_kwargs(module, component: str):
+                param_dtype = module.dtype if _aux_param_dtype_env == "match" else getattr(torch, _aux_param_dtype_env)
+                return dict(
+                    mp_policy=MixedPrecisionPolicy(
+                        param_dtype=param_dtype,
+                        reduce_dtype=torch.float32,
+                    ),
+                    mesh=device_mesh["rep", "shard"],
+                    reshard_after_forward=True,
+                    offload_policy=_fsdp_cpu_offload(component),
+                )
+
+            t5_kwargs = _aux_fsdp_kwargs(text_encoder, "t5")
+            for layer in text_encoder.encoder.block:
+                fully_shard(layer, **t5_kwargs)
+            fully_shard(text_encoder, **t5_kwargs)
+            rank0_log(f"FSDP wrapping done for T5 (param_dtype={t5_kwargs['mp_policy'].param_dtype}).")
+
+            clip_kwargs = _aux_fsdp_kwargs(image_clip, "clip")
             for layer in image_clip.vision_model.encoder.layers:
-                fully_shard(layer, **fsdp_kwargs)
-            fully_shard(image_clip, **fsdp_kwargs)
-            rank0_log("FSDP wrapping done for CLIP.")
+                fully_shard(layer, **clip_kwargs)
+            fully_shard(image_clip, **clip_kwargs)
+            rank0_log(f"FSDP wrapping done for CLIP (param_dtype={clip_kwargs['mp_policy'].param_dtype}).")
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -531,6 +652,7 @@ class WorldStereo:
             vae.enable_tiling()
             rank0_log("VAE tiling enabled (256px tiles, 192 stride).")
 
+        report_memory("aux models loaded")
         return text_encoder, image_clip, vae
 
     @staticmethod

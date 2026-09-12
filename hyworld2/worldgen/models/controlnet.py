@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 from diffusers.models import ModelMixin
@@ -54,6 +56,42 @@ class WanXControlNet(ModelMixin):
 
         self.gradient_checkpointing = False
 
+        # Hold the control features at the controlnet's own width, not the backbone's.
+        #
+        # This loop runs to completion before the backbone's first block does, and every
+        # tensor it appends stays alive until the backbone's last block returns -- the list
+        # is a local of WorldStereo*Model.forward and nothing drops it early. proj_out
+        # widens 1024 to 5120, so the list costs five times what the controlnet actually
+        # computed:
+        #
+        #   480x832, 21 latent frames, sp=4 -> 8,190 tokens/rank
+        #     20 x [1, 8190, 5120] bf16 = 1599.6 MiB     held across all 40 backbone blocks
+        #     20 x [1, 8190, 1024] bf16 =  319.9 MiB     the same information
+        #
+        # and it is one of the few line items that scales with --splitted_resolution: at 576
+        # the projected list is 2362 MiB and the unprojected one 472.5 MiB.
+        #
+        # Deferring the projection to the block that consumes it is arithmetically the same
+        # operation on the same input -- the same nn.Linear, under the same bf16 autocast,
+        # one loop later -- so the output does not change. Freeing each slot as it is
+        # consumed is the other half: without it the list would still be 20-deep at block 39.
+        #
+        # Off by default. WORLDSTEREO_CONTROLNET_LATE_PROJ=1 turns it on; leave it off to
+        # rule this out if control conditioning ever looks wrong.
+        self.late_proj = os.environ.get("WORLDSTEREO_CONTROLNET_LATE_PROJ", "0") not in ("0", "", "false")
+
+    def take_control_state(self, index, controlnet_states):
+        """Return control feature `index`, projected if it was not already, and free the slot.
+
+        Called once per backbone block. Dropping the list's reference here is what keeps the
+        live set at one or two tensors instead of twenty.
+        """
+        state = controlnet_states[index]
+        controlnet_states[index] = None
+        if self.late_proj:
+            state = self.proj_out[index](state)
+        return state
+
     def forward(self, hidden_states, temb, rotary_emb, **kwargs):
         hidden_states = self.proj_in(hidden_states)
         controlnet_states = []
@@ -72,20 +110,7 @@ class WanXControlNet(ModelMixin):
                     kwargs["image_height"],
                 )
 
-            else:
-                hidden_states = block(
-                    hidden_states=hidden_states,
-                    temb=temb,
-                    rotary_emb=rotary_emb,
-                    extrinsics=kwargs["extrinsics"],
-                    intrinsics=kwargs["intrinsics"],
-                    patches_x=kwargs["patches_x"],
-                    patches_y=kwargs["patches_y"],
-                    image_width=kwargs["image_width"],
-                    image_height=kwargs["image_height"],
-                )
-
-            controlnet_states.append(self.proj_out[i](hidden_states))
+            controlnet_states.append(hidden_states if self.late_proj else self.proj_out[i](hidden_states))
 
         return controlnet_states
 

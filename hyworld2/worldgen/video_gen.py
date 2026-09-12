@@ -15,7 +15,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from tqdm import tqdm
 from transformers import Sam3VideoModel, Sam3VideoProcessor
 
-from models.worldstereo_wrapper import WorldStereo
+from models.worldstereo_wrapper import WorldStereo, parked_on_cpu, report_memory
 from src.data_utils import sort_trajs, load_mutli_traj_dataset
 from src.general_utils import set_seed, load_video, rank0_log, Timer
 from src.retrieval_wm import LazyModel, PanoramaMemoryBank
@@ -192,6 +192,9 @@ if __name__ == "__main__":
                     pcd_nb_neighbors=args.pcd_nb_neighbors,
                     pcd_std_ratio=args.pcd_std_ratio,
                 )
+            # The resident floor, before a single trajectory is generated. Everything that
+            # is on the card at this point is on it for the whole stage.
+            report_memory("memory bank ready")
 
             for render_path in render_list:
                 with timer.track("[IO] Loading cameras"):
@@ -279,14 +282,26 @@ if __name__ == "__main__":
                     pipeline_kwargs["guidance_scale"] = 5.0
 
                 # pipeline inference
+                #
+                # MoGe and the memory bank's dinov2 are parked on the host across this call.
+                # Retrieval has just finished with dinov2 and alignment does not want MoGe
+                # until every trajectory is done, so both are idle for exactly the span that
+                # is short of memory. See parked_on_cpu for what they cost.
+                #
+                # Note that this single autocast is the OUTERMOST one: every autocast inside
+                # the pipeline is nested in it, and autocast only clears its weight cache
+                # when the outermost region exits. That is why the two encoders are taken out
+                # of autograd at load time -- see _load_aux.
                 with (
                     timer.track("Video Model Inference"),
+                    parked_on_cpu([moge_model, memory_bank.camera_selector.model], device=device),
                     torch.autocast("cuda", dtype=autocast_dtype, enabled=autocast_dtype is not None),
                 ):
                     output = worldstereo.pipeline(**pipeline_kwargs).frames[0].float()
 
                 gc.collect()
                 torch.cuda.empty_cache()
+                report_memory(f"{view_id}/{traj_id} generated")
 
                 if dist.get_rank() % sp_size == 0:
                     with timer.track("[IO] Save Results"):

@@ -501,8 +501,12 @@ class WorldStereoModel(_WorldStereoCommonMixin, WanTransformer3DModel):
                 hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
             # adding control features
+            #
+            # take_control_state, rather than indexing, so the controlnet can hand these back
+            # at its own 1024 width and widen them here instead of holding twenty 5120-wide
+            # copies for the whole loop. See WanXControlNet.__init__ for what that costs.
             if i < len(controlnet_states):
-                hidden_states += controlnet_states[i]
+                hidden_states += self.controlnet.take_control_state(i, controlnet_states)
 
         output = self._apply_output_projection(
             hidden_states=hidden_states,
@@ -759,8 +763,12 @@ class WorldStereoRefSModel(_WorldStereoCommonMixin, WanTransformer3DModel):
                                                   ref_states if self.controlnet_cfg.update_ref else reference_latent,
                                                   encoder_hidden_states, timestep_proj, rotary_emb, ref_rotary_emb, post_patch_num_frames, post_patch_height, post_patch_width, ref_index)
             # adding control features
+            #
+            # take_control_state, rather than indexing, so the controlnet can hand these back
+            # at its own 1024 width and widen them here instead of holding twenty 5120-wide
+            # copies for the whole loop. See WanXControlNet.__init__ for what that costs.
             if i < len(controlnet_states):
-                hidden_states += controlnet_states[i]
+                hidden_states += self.controlnet.take_control_state(i, controlnet_states)
 
         output = self._apply_output_projection(
             hidden_states=hidden_states,
