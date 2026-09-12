@@ -1,5 +1,5 @@
 import json
-import os.path
+import os
 
 import einops
 import numpy as np
@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
-from .general_utils import load_video, get_last_video_frame
+from .general_utils import load_video, get_last_video_frame, adjust_image_size, rank0_log
 
 try:
     from ..models.camera import get_camera_embedding, matrix_to_quaternion, unified_camera_normalization
@@ -17,6 +17,58 @@ except ImportError:
 from glob import glob
 
 def assign_scale(h, w, scale_map=None):
+    # Generation follows the render, when the run asks it to.
+    #
+    # Everything below picks a generation size by ASPECT RATIO alone: the scale_map holds
+    # the sizes the checkpoint was trained at, and argmin over |ratio difference| throws
+    # the requested pixel count away entirely. At upstream's --splitted_resolution 480
+    # that is invisible, because traj_generate.py:540-542 renders 480x832 and 480x832 is
+    # itself a rung -- the map returns the size it was handed, and nothing reveals that it
+    # was never looking at the size.
+    #
+    # Above 480 it stops being invisible, and it fails the same way at every rung:
+    #
+    #   render 576x1024 (ratio 0.5625) -> 480x832
+    #   render 640x1120 (ratio 0.5714) -> 480x832
+    #   render 720x1280 (ratio 0.5625) -> 480x832
+    #
+    # because 480x832's 0.5769 is nearer each of those than any other entry is. The map
+    # itself is not in this file -- it comes from the checkpoint config as cfg.scale_map --
+    # but it demonstrably CONTAINS 480x832, because the fallback map below does not, and
+    # under that one a 480 run would generate 480x768 against a 480x832 pano_bank and fail
+    # the same concatenate on width. Two 480 runs have completed. So raising
+    # --splitted_resolution buys no texture detail whatsoever, and it corrupts the memory
+    # bank on the way past: update_memory (retrieval_wm.py:1210) files those 480-tall
+    # generated frames beside the 720-tall pano_bank frames, and the NEXT trajectory's
+    # retrieval dies in np.concatenate (retrieval_wm.py:1158) with "the array at index 0
+    # has size 480 and the array at index 5 has size 720". That is run
+    # worldstereo2-20260912-011304 -- all four ranks, after traj, render and captions had
+    # already succeeded at 720x1280.
+    #
+    # Resizing the frames to agree would be the wrong repair twice over. It would hide a
+    # size the model was never asked to produce, and the texture ceiling -- the only
+    # reason anyone raises --splitted_resolution -- would not move by one pixel, which is
+    # a run that costs four A100-hours to produce the result it already had.
+    #
+    # So generate at the rendered size instead. The bank is then homogeneous by
+    # construction rather than by the coincidence that 480x832 is a rung, and the
+    # intrinsic rescale at line 190 below becomes the identity instead of an 832/1280
+    # shrink applied to frames whose cameras the memory bank goes on holding at render
+    # scale. adjust_image_size is the same rounding traj_generate.py:542 already applied,
+    # so for anything this pipeline rendered it returns the size unchanged; it is called
+    # rather than assumed because the transformer needs (h/16)*(w/16) divisible by 8 and
+    # a hand-set size need not satisfy that.
+    #
+    # Off by default, because the ladder also bounds the ABSOLUTE size and that still
+    # matters on the non-panorama path at line 152, where the input is an arbitrary image
+    # rather than something traj_generate sized. Turning it on is out-of-distribution for
+    # a checkpoint trained on the ladder, and it is paid for in VRAM: by the same
+    # rounding, 480 is 1560 tokens/frame, 576 is 2304, 640 is 2800 and 720 is 3600.
+    if os.environ.get("WORLDSTEREO_NATIVE_SCALE", "0") != "0":
+        native_h, native_w = adjust_image_size(h, w)
+        rank0_log(f"Native scale: generating at {native_h}x{native_w} for a {h}x{w} render.")
+        return [native_h, native_w]
+
     if scale_map is None:
         scale_map = [[480, 768], [512, 720], [576, 640], [608, 608], [640, 576], [720, 512], [768, 480]]
     hw_ratio = h / w

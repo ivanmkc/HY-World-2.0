@@ -41,6 +41,8 @@ from safetensors.torch import load_file as load_safetensors
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
 
+from torch.distributed.fsdp import CPUOffloadPolicy, OffloadPolicy
+
 from .attention import WanAttnProcessorSP
 from .dmd_scheduler import FlowGeneratorScheduler
 from .pipelines.pipeline_dmd_keyframe import RefKFDMDGeneratorPipeline
@@ -97,6 +99,52 @@ warnings.filterwarnings("ignore", category=UserWarning, module="diffusers")
 # ──────────────────────────────────────────────────────────────────────
 
 SUPPORTED_MODEL_TYPES = ("worldstereo-camera", "worldstereo-memory", "worldstereo-memory-dmd")
+
+
+def _env_on(name: str, default: str = "0") -> bool:
+    """Read a WORLDSTEREO_* switch. Absent means the behaviour this file had before it existed."""
+    return os.environ.get(name, default).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _fsdp_cpu_offload(component: str) -> OffloadPolicy:
+    """Keep this component's FSDP shard in pinned host RAM instead of on the card.
+
+    WORLDSTEREO_FSDP_CPU_OFFLOAD is a comma-separated list of t5, clip, transformer.
+    CPUOffloadPolicy copies the sharded parameters host-to-device immediately before each
+    all-gather, so the shard costs nothing on the card between forwards -- which is the
+    whole point for the text encoder, whose 2.64 GiB shard is touched once per trajectory
+    and then sits through fifteen seconds of denoising.
+
+    Empty by default, because it buys memory with PCIe bandwidth and the transformer entry
+    in particular pays 8.72 GB of host-to-device traffic on every one of the four DMD steps.
+    """
+    wanted = {p.strip().lower() for p in os.environ.get("WORLDSTEREO_FSDP_CPU_OFFLOAD", "").split(",")}
+    if component in wanted:
+        rank0_log(f"FSDP CPU offload enabled for {component}; its shard will live in pinned host RAM.")
+        return CPUOffloadPolicy(pin_memory=True)
+    return OffloadPolicy()
+
+
+def _report_memory(label: str) -> None:
+    """Print the card's real high-water mark, because every number below was inferred.
+
+    The budget for this stage was assembled from safetensors headers and two OOM messages,
+    not from the device: nvidia-smi's once-a-minute heartbeat says 40,433 MiB of 40,960 and
+    nothing about what is in it. WORLDSTEREO_MEM_REPORT=1 turns torch's own accounting on at
+    the four points that matter, which is what will settle the decomposition on the next run.
+
+    max_memory_allocated is reset at each label, so each line is the peak of the phase that
+    just ended rather than the peak of the run so far.
+    """
+    if not _env_on("WORLDSTEREO_MEM_REPORT") or not torch.cuda.is_available():
+        return
+    gib = 1024**3
+    rank0_log(
+        f"[mem] {label}: allocated={torch.cuda.memory_allocated() / gib:.2f} GiB "
+        f"reserved={torch.cuda.memory_reserved() / gib:.2f} GiB "
+        f"peak_since_last={torch.cuda.max_memory_allocated() / gib:.2f} GiB"
+    )
+    torch.cuda.reset_peak_memory_stats()
 
 
 def _get_half_dtype() -> torch.dtype:

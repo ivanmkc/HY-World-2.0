@@ -891,6 +891,21 @@ class PanoramaMemoryBank:
         self.align_start_index = self.mem_size
         rank0_log(f"Initialized panorama memory size: {self.mem_size}")
 
+        # The bank holds exactly one resolution -- see update_memory for why, and for the
+        # run that proved it. This is the same invariant at the other door: pano_bank is
+        # written once by traj_generate and skipped on re-runs (--skip_exist), so a scene
+        # directory reused at a new --splitted_resolution keeps the old bank while
+        # start_frame.png, which is where image_width/image_height above came from, is the
+        # new size. Cheap to check, and it names the stale directory instead of surfacing
+        # as a shape error two stages later.
+        bank_sizes = {frame.size for frame in self.ref_frames}
+        if bank_sizes and bank_sizes != {(image_width, image_height)}:
+            raise ValueError(
+                f"pano_bank frames are {sorted(bank_sizes)} (w,h) but the memory bank was built for "
+                f"{image_width}x{image_height} from start_frame.png; {memory_bank_path} was rendered at a "
+                f"different --splitted_resolution, so delete render_results and re-run stage traj"
+            )
+
         rank0_log(f"Initializing Moge Model...")
         if moge_model is None:
             self.moge_model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").to(device)
@@ -1153,6 +1168,34 @@ class PanoramaMemoryBank:
         gen_frames: [PIL.Image] * N
         """
         assert tar_w2cs_full.shape[0] == tar_Ks_full.shape[0] == len(gen_frames)
+
+        # Every frame in this bank is one size, and this is the only place that can say so
+        # while both numbers are still in hand.
+        #
+        # image_height/image_width come from start_frame.png (video_gen.py:172), which
+        # traj_generate wrote at the rendered size. The frames arriving here come back from
+        # the video model at whatever assign_scale chose (data_utils.py:154), which before
+        # WORLDSTEREO_NATIVE_SCALE was a ratio-nearest rung of the checkpoint's ladder and
+        # therefore 480x832 for every render above 480. When the two disagree the bank
+        # silently mixes resolutions and says nothing: the failure lands one trajectory
+        # later, inside np.concatenate at line 1158, as "the array at index 0 has size 480
+        # and the array at index 5 has size 720" -- four dead ranks in
+        # worldstereo2-20260912-011304, forty minutes of four A100s downstream of the cause.
+        #
+        # Nothing below tolerates a mixed bank either, so this is a real invariant rather
+        # than a convenience for the concatenate: get_guided_depth_infos_v2 is called with
+        # height=self.image_height/width=self.image_width (line 1706) and the predicted
+        # normals are reshaped to that same pair (line 1815). A frame of another size would
+        # be geometrically misaligned with its own depth, which is the kind of wrong that
+        # still finishes and still trains a world.
+        gen_w, gen_h = gen_frames[0].size
+        if (gen_h, gen_w) != (self.image_height, self.image_width):
+            raise ValueError(
+                f"generated frames are {gen_h}x{gen_w} but the memory bank was built for "
+                f"{self.image_height}x{self.image_width}: the video model is not generating at the rendered "
+                f"resolution. Set WORLDSTEREO_NATIVE_SCALE=1 so assign_scale keeps the rendered size, or "
+                f"render at a size the checkpoint's scale_map already contains"
+            )
 
         # Downsample frames that need updates in the memory bank, skipping the first frame.
         nframe = len(gen_frames)
