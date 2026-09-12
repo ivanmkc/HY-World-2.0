@@ -110,6 +110,19 @@ class WanXControlNet(ModelMixin):
                     kwargs["image_height"],
                 )
 
+            else:
+                hidden_states = block(
+                    hidden_states=hidden_states,
+                    temb=temb,
+                    rotary_emb=rotary_emb,
+                    extrinsics=kwargs["extrinsics"],
+                    intrinsics=kwargs["intrinsics"],
+                    patches_x=kwargs["patches_x"],
+                    patches_y=kwargs["patches_y"],
+                    image_width=kwargs["image_width"],
+                    image_height=kwargs["image_height"],
+                )
+
             controlnet_states.append(hidden_states if self.late_proj else self.proj_out[i](hidden_states))
 
         return controlnet_states
